@@ -39,6 +39,7 @@ DEFAULT_OUTPUT_DIR = ROOT / "results"
 HEADER_SIZE = 256
 RECORD_SIZE = 16
 HEADER_STRUCT = struct.Struct("<8sIIIIIQQQ160s44s")
+RECORD_STRUCT = struct.Struct("<IIII")
 MAGIC = b"GB10PTX\0"
 FORMAT_VERSION = 1
 LARGE_OUTPUT_BYTES = 16 * 1024**3
@@ -853,6 +854,44 @@ def range_metadata(value_range: ValueRange) -> dict[str, int]:
     }
 
 
+def sweep_spec(test: Test, sweep: Sweep) -> dict[str, object]:
+    return {
+        "test_name": test.name,
+        "ptx": test.ptx,
+        "kind": test.kind,
+        "result_mask": test.mask,
+        "sweep": sweep.name,
+        "ranges": {
+            "source_a": range_metadata(sweep.a),
+            "source_b": range_metadata(sweep.b),
+            "source_c": range_metadata(sweep.c),
+        },
+    }
+
+
+def canonical_sha256(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def sweep_spec_sha256(test: Test, sweep: Sweep) -> str:
+    return canonical_sha256(sweep_spec(test, sweep))
+
+
+def matrix_sha256(tests: Sequence[Test]) -> str:
+    return canonical_sha256(
+        [sweep_spec(test, sweep) for test in tests for sweep in test.sweeps]
+    )
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def shard_slice(total: int, index: int, count: int) -> tuple[int, int]:
     start = total * index // count
     end = total * (index + 1) // count
@@ -896,6 +935,121 @@ def read_header(path: Path) -> dict[str, object]:
         "shard_records": shard_records,
         "bytes": actual_size,
     }
+
+
+def validate_binary_inputs(
+    path: Path,
+    sweep: Sweep,
+    shard_start: int,
+    shard_records: int,
+) -> str:
+    """Verify every source tuple and return the SHA256 of the complete file."""
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        return _validate_binary_inputs_numpy(
+            path, sweep, shard_start, shard_records, np
+        )
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        header = stream.read(HEADER_SIZE)
+        if len(header) != HEADER_SIZE:
+            raise RuntimeError(f"truncated binary header: {path}")
+        digest.update(header)
+        for local_index in range(shard_records):
+            raw = stream.read(RECORD_SIZE)
+            if len(raw) != RECORD_SIZE:
+                raise RuntimeError(f"truncated record {local_index}: {path}")
+            digest.update(raw)
+            source_a, source_b, source_c, _result = RECORD_STRUCT.unpack(raw)
+            linear = shard_start + local_index
+            c_index = linear % sweep.c.count
+            linear //= sweep.c.count
+            b_index = linear % sweep.b.count
+            linear //= sweep.b.count
+            a_index = linear % sweep.a.count
+            expected = (
+                min(sweep.a.maximum, sweep.a.start + a_index * sweep.a.stride),
+                min(sweep.b.maximum, sweep.b.start + b_index * sweep.b.stride),
+                min(sweep.c.maximum, sweep.c.start + c_index * sweep.c.stride),
+            )
+            actual = (source_a, source_b, source_c)
+            if actual != expected:
+                raise RuntimeError(
+                    f"input enumeration mismatch in {path} at record {local_index}: "
+                    f"actual={actual!r}, expected={expected!r}"
+                )
+        if stream.read(1):
+            raise RuntimeError(f"trailing binary data: {path}")
+    return digest.hexdigest()
+
+
+def _validate_binary_inputs_numpy(
+    path: Path,
+    sweep: Sweep,
+    shard_start: int,
+    shard_records: int,
+    np: object,
+) -> str:
+    """Vectorized full-record validator; ``np`` is injected for optional import."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        header = stream.read(HEADER_SIZE)
+    if len(header) != HEADER_SIZE:
+        raise RuntimeError(f"truncated binary header: {path}")
+    digest.update(header)
+    records = np.memmap(
+        path,
+        dtype="<u4",
+        mode="r",
+        offset=HEADER_SIZE,
+        shape=(shard_records, 4),
+    )
+    chunk_records = 4 * 1024 * 1024
+    try:
+        for begin in range(0, shard_records, chunk_records):
+            end = min(shard_records, begin + chunk_records)
+            chunk = records[begin:end]
+            digest.update(chunk)
+            linear = np.arange(
+                shard_start + begin,
+                shard_start + end,
+                dtype=np.uint64,
+            )
+            c_index = linear % sweep.c.count
+            linear //= sweep.c.count
+            b_index = linear % sweep.b.count
+            linear //= sweep.b.count
+            a_index = linear % sweep.a.count
+            expected_columns = (
+                np.minimum(
+                    sweep.a.maximum,
+                    sweep.a.start + a_index * sweep.a.stride,
+                ).astype(np.uint32),
+                np.minimum(
+                    sweep.b.maximum,
+                    sweep.b.start + b_index * sweep.b.stride,
+                ).astype(np.uint32),
+                np.minimum(
+                    sweep.c.maximum,
+                    sweep.c.start + c_index * sweep.c.stride,
+                ).astype(np.uint32),
+            )
+            for column, expected in enumerate(expected_columns):
+                mismatches = np.flatnonzero(chunk[:, column] != expected)
+                if mismatches.size:
+                    local = begin + int(mismatches[0])
+                    actual_tuple = tuple(int(value) for value in records[local, :3])
+                    raise RuntimeError(
+                        f"input enumeration mismatch in {path} at record {local}: "
+                        f"actual={actual_tuple!r}"
+                    )
+    finally:
+        del records
+    return digest.hexdigest()
 
 
 def compare_binary(actual: Path, reference: Path) -> None:
@@ -987,6 +1141,21 @@ def execute_tests(
         command.extend([chunk_records, partial_output])
         run(command)
         summary = read_header(partial_output)
+        expected_header = {
+            "test_id": test_id,
+            "test_name": test.name,
+            "result_mask": test.mask,
+            "total_records": sweep.count,
+            "shard_start": start,
+            "shard_records": count,
+        }
+        for field, expected in expected_header.items():
+            if summary[field] != expected:
+                raise RuntimeError(
+                    f"generated binary header mismatch for {partial_output}: "
+                    f"{field}={summary[field]!r}, expected={expected!r}"
+                )
+        binary_sha256 = validate_binary_inputs(partial_output, sweep, start, count)
         summary.update(
             {
                 "ptx": test.ptx,
@@ -997,6 +1166,8 @@ def execute_tests(
                     "source_b": range_metadata(sweep.b),
                     "source_c": range_metadata(sweep.c),
                 },
+                "spec_sha256": sweep_spec_sha256(test, sweep),
+                "sha256": binary_sha256,
             }
         )
         if reference_dir is not None:
@@ -1043,6 +1214,29 @@ def write_manifest(
     shard_count: int,
     summaries: Sequence[dict[str, object]],
 ) -> Path:
+    manifest = manifest_path(output_dir, tests, shard_index, shard_count)
+    payload = {
+        "manifest_version": 2,
+        "format": "GB10 PTX accuracy binary v1",
+        "profile": profile,
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "test_count": len(tests),
+        "matrix_sha256": matrix_sha256(tests),
+        "result_files": list(summaries),
+    }
+    temporary = manifest.with_suffix(manifest.suffix + ".partial")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(manifest)
+    return manifest
+
+
+def manifest_path(
+    output_dir: Path,
+    tests: Sequence[Test],
+    shard_index: int,
+    shard_count: int,
+) -> Path:
     families = {test.name.split("__", 1)[0] for test in tests}
     if len(families) == 1:
         selection = safe_name(next(iter(families)))
@@ -1051,19 +1245,9 @@ def write_manifest(
     else:
         digest = hashlib.sha256("\n".join(test.name for test in tests).encode()).hexdigest()[:12]
         selection = f"selection-{digest}"
-    manifest = output_dir / (
+    return output_dir / (
         f"manifest-{selection}__shard-{shard_index:05d}-of-{shard_count:05d}.json"
     )
-    payload = {
-        "format": "GB10 PTX accuracy binary v1",
-        "profile": profile,
-        "shard_index": shard_index,
-        "shard_count": shard_count,
-        "test_count": len(tests),
-        "result_files": list(summaries),
-    }
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    return manifest
 
 
 def print_plan(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import dataclasses
 import sys
 import tempfile
 import unittest
@@ -32,6 +33,88 @@ def values(value_range: object) -> tuple[int, ...]:
         min(value_range.maximum, value_range.start + index * value_range.stride)
         for index in range(value_range.count)
     )
+
+
+def write_synthetic_result(
+    output: Path,
+    test: object,
+    *,
+    test_id: int = 0,
+    sealed: bool = True,
+) -> tuple[Path, Path]:
+    sweep = test.sweeps[0]
+    shard_index = 0
+    start, count = runner.shard_slice(sweep.count, shard_index, all_strided.SHARD_COUNT)
+    path = all_strided.expected_path(output, test, sweep, shard_index)
+    path.parent.mkdir(parents=True)
+    name = test.name.encode()
+    header = runner.HEADER_STRUCT.pack(
+        runner.MAGIC,
+        runner.FORMAT_VERSION,
+        runner.HEADER_SIZE,
+        runner.RECORD_SIZE,
+        test_id,
+        test.mask,
+        sweep.count,
+        start,
+        count,
+        name + b"\0" * (160 - len(name)),
+        b"\0" * 44,
+    )
+    records = bytearray()
+    for local in range(count):
+        linear = start + local
+        c_index = linear % sweep.c.count
+        linear //= sweep.c.count
+        b_index = linear % sweep.b.count
+        linear //= sweep.b.count
+        a_index = linear % sweep.a.count
+        records.extend(
+            runner.RECORD_STRUCT.pack(
+                min(sweep.a.maximum, sweep.a.start + a_index * sweep.a.stride),
+                min(sweep.b.maximum, sweep.b.start + b_index * sweep.b.stride),
+                min(sweep.c.maximum, sweep.c.start + c_index * sweep.c.stride),
+                0x1234,
+            )
+        )
+    path.write_bytes(header + records)
+    summary = runner.read_header(path)
+    summary.update(
+        {
+            "ptx": test.ptx,
+            "sweep": sweep.name,
+            "file": path.relative_to(output).as_posix(),
+            "ranges": {
+                "source_a": runner.range_metadata(sweep.a),
+                "source_b": runner.range_metadata(sweep.b),
+                "source_c": runner.range_metadata(sweep.c),
+            },
+            "comparison": "golden-captured",
+        }
+    )
+    if sealed:
+        summary["spec_sha256"] = runner.sweep_spec_sha256(test, sweep)
+        summary["sha256"] = runner.file_sha256(path)
+        manifest = runner.write_manifest(
+            output, [test], "full", shard_index, all_strided.SHARD_COUNT, [summary]
+        )
+    else:
+        manifest = runner.manifest_path(
+            output, [test], shard_index, all_strided.SHARD_COUNT
+        )
+        manifest.write_text(
+            runner.json.dumps(
+                {
+                    "format": "GB10 PTX accuracy binary v1",
+                    "profile": "full",
+                    "shard_index": shard_index,
+                    "shard_count": all_strided.SHARD_COUNT,
+                    "test_count": 1,
+                    "result_files": [summary],
+                }
+            )
+        )
+    return path, manifest
 
 
 class RunnerContractTests(unittest.TestCase):
@@ -135,6 +218,79 @@ class RunnerContractTests(unittest.TestCase):
             for index in range(16)
         )
         self.assertEqual(total_131, 13_793_736_896)
+
+    def test_integrity_manifest_rejects_payload_mutation(self) -> None:
+        test = runner.select_tests(
+            ["fp16x2_to_f6x2__f16x2__e2m3x2__norelu"]
+        )[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            path, _manifest = write_synthetic_result(output, test)
+            all_strided.validate_shard_manifest(output, [test], 0)
+            with path.open("r+b") as stream:
+                stream.seek(runner.HEADER_SIZE + 12)
+                original = stream.read(1)
+                stream.seek(runner.HEADER_SIZE + 12)
+                stream.write(bytes([original[0] ^ 0x01]))
+            with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"):
+                all_strided.validate_shard_manifest(output, [test], 0)
+
+    def test_integrity_manifest_rejects_wrong_test_id(self) -> None:
+        test = runner.select_tests(
+            ["fp16x2_to_f6x2__f16x2__e2m3x2__norelu"]
+        )[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            write_synthetic_result(output, test, test_id=999)
+            with self.assertRaisesRegex(RuntimeError, "test_id"):
+                all_strided.validate_shard_manifest(output, [test], 0)
+
+    def test_seal_refuses_to_relabel_legacy_provenance(self) -> None:
+        test = runner.select_tests(
+            ["fp16x2_to_f6x2__f16x2__e2m3x2__norelu"]
+        )[0]
+        changed = dataclasses.replace(test, ptx="totally.different.ptx")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            write_synthetic_result(output, test, sealed=False)
+            with self.assertRaisesRegex(RuntimeError, "provenance mismatch"):
+                all_strided.seal_shard_manifest(output, [changed], 0)
+
+    def test_seal_upgrades_legacy_manifest_without_relabeling(self) -> None:
+        test = runner.select_tests(
+            ["fp16x2_to_f6x2__f16x2__e2m3x2__norelu"]
+        )[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            _binary, manifest = write_synthetic_result(output, test, sealed=False)
+            all_strided.seal_shard_manifest(output, [test], 0)
+            payload = runner.json.loads(manifest.read_text())
+            self.assertEqual(payload["manifest_version"], 2)
+            self.assertEqual(payload["matrix_sha256"], runner.matrix_sha256([test]))
+            self.assertEqual(payload["result_files"][0]["ptx"], test.ptx)
+            self.assertEqual(len(payload["result_files"][0]["sha256"]), 64)
+
+    def test_numerical_coverage_requires_bound_fp6_matrix(self) -> None:
+        tests = all_strided.selected_tests((13, 1))
+        fp6_tests = [
+            test for test in tests if test.name.startswith("fp16x2_to_f6x2__")
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "fp6-reference.json"
+            payload = {
+                "status": "PASS",
+                "test_count": len(fp6_tests),
+                "matrix_sha256": runner.matrix_sha256(fp6_tests),
+                "reference": {"lanes": 4_128},
+            }
+            report.write_text(runner.json.dumps(payload))
+            coverage = all_strided.numerical_reference_coverage(report, tests)
+            self.assertEqual(coverage["status"], "PARTIAL_REFERENCE_PASS")
+            self.assertEqual(coverage["test_count"], 8)
+            payload["matrix_sha256"] = "0" * 64
+            report.write_text(runner.json.dumps(payload))
+            rejected = all_strided.numerical_reference_coverage(report, tests)
+            self.assertEqual(rejected["status"], "NOT_INDEPENDENTLY_VALIDATED")
 
     def test_bounded_full_runs_missing_precheck_automatically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

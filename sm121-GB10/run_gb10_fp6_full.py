@@ -16,6 +16,7 @@ from typing import Sequence
 
 import run_gb10_fp6_precheck as precheck
 import run_gb10_ptx_accuracy as runner
+import run_gb10_all_strided as integrity
 
 
 ROOT = Path(__file__).resolve().parent
@@ -56,24 +57,10 @@ def shard_complete(
     tests: Sequence[runner.Test],
     shard_index: int,
 ) -> bool:
-    for test in tests:
-        total_records = test.sweeps[0].count
-        start, count = runner.shard_slice(total_records, shard_index, SHARD_COUNT)
-        path = expected_path(output_dir, test, shard_index)
-        if not path.is_file():
-            return False
-        try:
-            header = runner.read_header(path)
-        except Exception:
-            return False
-        if (
-            header["test_name"] != test.name
-            or header["result_mask"] != 0xFFFF
-            or header["total_records"] != total_records
-            or header["shard_start"] != start
-            or header["shard_records"] != count
-        ):
-            return False
+    try:
+        integrity.validate_shard_manifest(output_dir, tests, shard_index)
+    except Exception:
+        return False
     return True
 
 
@@ -110,9 +97,11 @@ def load_precheck_report(path: Path) -> tuple[dict[str, object], str]:
     if report.get("status") != "PASS":
         raise RuntimeError(f"precheck status is not PASS: {path}")
     reference = report.get("reference")
+    tests = runner.select_tests([precheck.TEST_PATTERN])
     if (
         not isinstance(reference, dict)
         or reference.get("lanes") != precheck.EXPECTED_REFERENCE_LANES
+        or report.get("matrix_sha256") != runner.matrix_sha256(tests)
     ):
         raise RuntimeError(f"precheck reference coverage is incomplete: {path}")
     return report, hashlib.sha256(raw).hexdigest()
@@ -167,28 +156,18 @@ def write_report(
     tests: Sequence[runner.Test],
     elapsed: float,
 ) -> Path:
-    binaries = [
-        expected_path(output_dir, test, shard_index)
-        for shard_index in range(SHARD_COUNT)
-        for test in tests
-    ]
-    missing = [path for path in binaries if not path.is_file()]
-    if missing:
-        raise RuntimeError(f"full sweep is missing {len(missing)} binaries")
-    partials = sorted(output_dir.rglob("*.partial"))
-    if partials:
-        raise RuntimeError(f"full sweep has {len(partials)} incomplete .partial files")
-    manifests = sorted(output_dir.glob("manifest-fp16x2_to_f6x2__shard-*.json"))
-    if len(manifests) != SHARD_COUNT:
-        raise RuntimeError(f"expected {SHARD_COUNT} manifests, found {len(manifests)}")
+    binaries, manifests = integrity.validate_all(output_dir, tests)
     report = {
-        "status": "PASS",
+        "status": "ACCURACY_PASS",
+        "capture_status": "PASS",
+        "accuracy_status": "INDEPENDENT_REFERENCE_PASS",
         "instruction_family": "cvt.rn.satfinite{.relu}.{e2m3x2/e3m2x2}.{f16x2/bf16x2}",
         "arch": precheck.ARCH,
         "shard_count": SHARD_COUNT,
         "test_count": len(tests),
         "binary_count": len(binaries),
         "binary_bytes": sum(path.stat().st_size for path in binaries),
+        "matrix_sha256": runner.matrix_sha256(tests),
         "precheck_report": str(precheck_report),
         "precheck_report_sha256": precheck_sha256,
         "elapsed_seconds_this_invocation": elapsed,

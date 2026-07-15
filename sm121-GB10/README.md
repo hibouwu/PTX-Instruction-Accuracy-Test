@@ -19,8 +19,9 @@
 4. 对每条具体 PTX 执行单记录 preflight；
 5. 两次执行 smoke 并逐字节验证确定性；
 6. 按 16 个分片运行或续跑全部 sweep；
-7. 校验 header、范围、文件长度、manifest 和 `.partial`；
-8. 生成最终 `full-run-report.json`。
+7. 逐记录校验输入枚举、`test_id`、header、文件长度和 `.partial`；
+8. 在运行时原始 manifest 中保存 matrix/spec/file SHA256；
+9. 严格验证原始 manifest，生成最终 `full-run-report.json`，不从当前代码重建历史 provenance。
 
 CUDA 13.1 当前覆盖：
 
@@ -58,6 +59,30 @@ python3 run_gb10_all_strided.py full \
 ```bash
 python3 run_gb10_all_strided.py report
 ```
+
+### 封存旧版已经跑完的结果
+
+旧版 manifest 没有 SHA256。拉取新版代码后先执行：
+
+```bash
+python3 run_gb10_all_strided.py seal
+```
+
+该命令不会重新执行 GPU sweep。它要求旧 manifest 中的 PTX、sweep、range 和文件集合与当前矩阵完全一致，再逐条检查 2,000 个 `.bin` 的输入枚举和 header，计算 SHA256，并原子升级 manifest。若 provenance 不一致会停止，不会把旧数据重新标成新定义。
+
+`seal` 需要顺序读取约 12.846 GiB。环境中有 NumPy 时会自动分块向量化；没有 NumPy 也能运行，但全记录校验会明显变慢。可先确认：
+
+```bash
+python3 -c 'import numpy; print(numpy.__version__)'
+```
+
+封存完成后可重复执行：
+
+```bash
+python3 run_gb10_all_strided.py report
+```
+
+任何 payload 字节、输入记录、`test_id`、规格或 manifest 被修改，报告都会失败。
 
 默认输出：
 
@@ -118,6 +143,15 @@ results/fp6-strided-precheck/precheck-report.json
 results/fp6-strided-full/full-run-report.json
 ```
 
+新版报告会把 FP6 参考结果绑定到测试矩阵 SHA256。若报告由旧版脚本生成，重新运行一次：
+
+```bash
+python3 run_gb10_fp6_precheck.py --overwrite
+python3 run_gb10_all_strided.py report
+```
+
+之后统一报告的 `accuracy_status` 才会是 `PARTIAL_REFERENCE_PASS`，并明确记录只有 8 条 FP6 获得独立数值验证。
+
 ## 通用底层 runner
 
 列出全部 85 条矩阵定义：
@@ -147,7 +181,15 @@ python3 run_gb10_ptx_accuracy.py \
 GB10 golden capture with structural validation
 ```
 
-这证明输入范围、JIT 执行、二进制结构、分片完整性和重复性，但不能表述成与独立数值模型比较通过。FP6 专用 precheck 是当前具备独立软件数值参考的例外。
+统一报告使用：
+
+```text
+status = CAPTURE_COMPLETE
+capture_status = PASS
+accuracy_status = NOT_INDEPENDENTLY_VALIDATED 或 PARTIAL_REFERENCE_PASS
+```
+
+这证明输入范围、JIT 执行、二进制结构、SHA256、分片完整性和重复性，但不能表述成全部指令与独立数值模型比较通过。只有当绑定同一 FP6 测试矩阵的专用 precheck 存在时，报告才把 8 条 FP6 标记为 `PARTIAL_REFERENCE_PASS`；其余指令仍不宣称数值精度通过。
 
 ## 二进制格式
 
@@ -166,7 +208,7 @@ uint32 masked_result
 256 + shard_records × 16 bytes
 ```
 
-header 保存格式版本、具体指令名、result mask、完整 sweep 记录数、分片起点和分片记录数。输入范围和 stride 同时记录在 manifest 中。结果先写入 `.bin.partial`，校验成功后再原子替换为 `.bin`。
+header 保存格式版本、具体指令名、`test_id`、result mask、完整 sweep 记录数、分片起点和分片记录数。输入范围、stride、matrix/spec SHA256 和完整文件 SHA256 记录在运行时原始 manifest 中。结果与 manifest 都先写入 `.partial`，校验成功后再原子替换。
 
 ## CPU 合约测试
 
@@ -176,4 +218,4 @@ python3 -m unittest -v \
   test_run_gb10_fp6_precheck.py
 ```
 
-合约测试会检查全部 85 条矩阵定义、全局 stride、endpoint 包含规则、CUDA 13.1/13.2 选择数量、ADD/FMA 多 sweep、容量估算、分片覆盖和 FP6 软件参考表。
+合约测试会检查全部 85 条矩阵定义、全局 stride、endpoint 包含规则、CUDA 13.1/13.2 选择数量、ADD/FMA 多 sweep、容量估算、分片覆盖、FP6 软件参考表，以及 payload 篡改、错误 `test_id`、manifest 错误重标和旧结果安全封存。

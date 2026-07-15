@@ -57,6 +57,14 @@ results/all-strided-cuda13.1-precheck/
 results/all-strided-cuda13.1-full/
 ```
 
+如果结果由旧版脚本生成，更新代码后先原地封存，不需要重跑 12.846 GiB：
+
+```bash
+python3 run_gb10_all_strided.py seal
+```
+
+`seal` 会核对运行时原始 manifest、逐记录输入枚举和 `test_id`，为每个二进制加入 SHA256 与测试规格摘要；它不会根据新代码重写旧 PTX/range。没有独立数值模型的统一报告状态为 `CAPTURE_COMPLETE`，不能表述为全部指令精度 `PASS`。
+
 CUDA 13.2 环境运行全部 85 条：
 
 ```bash

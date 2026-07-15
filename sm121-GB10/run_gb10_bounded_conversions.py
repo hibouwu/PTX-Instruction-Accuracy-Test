@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Sequence
 
 import run_gb10_ptx_accuracy as runner
+import run_gb10_all_strided as integrity
 
 
 ROOT = Path(__file__).resolve().parent
@@ -53,7 +54,7 @@ def parse_args() -> argparse.Namespace:
             "FP4/UE8M0/S2F6 and inverse conversion instructions."
         )
     )
-    parser.add_argument("command", choices=("precheck", "plan", "full", "report"))
+    parser.add_argument("command", choices=("precheck", "plan", "full", "seal", "report"))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--precheck-dir", type=Path, default=DEFAULT_PRECHECK_DIR)
     parser.add_argument("--nvcc", default="/usr/local/cuda/bin/nvcc")
@@ -174,6 +175,9 @@ def run_precheck(args: argparse.Namespace, tests: Sequence[runner.Test]) -> Path
                 f"precheck output already exists: {output_dir}; "
                 "pass --overwrite-precheck to replace it"
             )
+        protected = {Path("/"), Path.home().resolve(), ROOT.resolve(), ROOT.parent.resolve()}
+        if output_dir in protected or len(output_dir.parts) < 4:
+            raise RuntimeError(f"refusing to remove unsafe precheck path: {output_dir}")
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
     started = time.time()
@@ -241,33 +245,16 @@ def expected_path(
     )
 
 
-def result_complete(path: Path, test: runner.Test, shard_index: int) -> bool:
-    if not path.is_file():
-        return False
-    sweep = test.sweeps[0]
-    start, count = runner.shard_slice(sweep.count, shard_index, SHARD_COUNT)
-    try:
-        header = runner.read_header(path)
-    except Exception:
-        return False
-    return bool(
-        header["test_name"] == test.name
-        and header["result_mask"] == test.mask
-        and header["total_records"] == sweep.count
-        and header["shard_start"] == start
-        and header["shard_records"] == count
-    )
-
-
 def shard_complete(
     output_dir: Path,
     tests: Sequence[runner.Test],
     shard_index: int,
 ) -> bool:
-    return all(
-        result_complete(expected_path(output_dir, test, shard_index), test, shard_index)
-        for test in tests
-    )
+    try:
+        integrity.validate_shard_manifest(output_dir, tests, shard_index)
+    except Exception:
+        return False
+    return True
 
 
 def remove_stale_partials(
@@ -351,69 +338,11 @@ def run_one_shard(
     )
 
 
-def write_existing_manifest(
-    output_dir: Path,
-    tests: Sequence[runner.Test],
-    shard_index: int,
-) -> Path:
-    summaries: list[dict[str, object]] = []
-    for test in tests:
-        sweep = test.sweeps[0]
-        path = expected_path(output_dir, test, shard_index)
-        summary = runner.read_header(path)
-        summary.update(
-            {
-                "ptx": test.ptx,
-                "sweep": sweep.name,
-                "file": path.relative_to(output_dir).as_posix(),
-                "ranges": {
-                    "source_a": runner.range_metadata(sweep.a),
-                    "source_b": runner.range_metadata(sweep.b),
-                    "source_c": runner.range_metadata(sweep.c),
-                },
-                "comparison": "golden-captured",
-            }
-        )
-        summaries.append(summary)
-    return runner.write_manifest(
-        output_dir,
-        tests,
-        "full",
-        shard_index,
-        SHARD_COUNT,
-        summaries,
-    )
-
-
 def validate_all(
     output_dir: Path,
     tests: Sequence[runner.Test],
 ) -> tuple[list[Path], list[Path]]:
-    binaries = [
-        expected_path(output_dir, test, shard_index)
-        for shard_index in range(SHARD_COUNT)
-        for test in tests
-    ]
-    invalid = [
-        path
-        for shard_index in range(SHARD_COUNT)
-        for test in tests
-        if not result_complete(
-            path := expected_path(output_dir, test, shard_index),
-            test,
-            shard_index,
-        )
-    ]
-    if invalid:
-        raise RuntimeError(f"full sweep has {len(invalid)} missing or invalid binaries")
-    partials = sorted(output_dir.rglob("*.partial"))
-    if partials:
-        raise RuntimeError(f"full sweep has {len(partials)} incomplete .partial files")
-    manifests = [
-        write_existing_manifest(output_dir, tests, shard_index)
-        for shard_index in range(SHARD_COUNT)
-    ]
-    return binaries, manifests
+    return integrity.validate_all(output_dir, tests)
 
 
 def write_report(
@@ -425,7 +354,9 @@ def write_report(
 ) -> Path:
     binaries, manifests = validate_all(output_dir, tests)
     report = {
-        "status": "PASS",
+        "status": "CAPTURE_COMPLETE",
+        "capture_status": "PASS",
+        "accuracy_status": "NOT_INDEPENDENTLY_VALIDATED",
         "result_kind": "GB10 golden capture with structural validation",
         "independent_numerical_reference": False,
         "arch": ARCH,
@@ -435,6 +366,7 @@ def write_report(
         "binary_count": len(binaries),
         "binary_bytes": sum(path.stat().st_size for path in binaries),
         "manifest_count": len(manifests),
+        "matrix_sha256": runner.matrix_sha256(tests),
         "precheck_report": str(precheck_report),
         "precheck_report_sha256": precheck_sha256,
         "elapsed_seconds_this_invocation": elapsed,
@@ -447,20 +379,39 @@ def write_report(
 def main() -> None:
     args = parse_args()
     tests = selected_tests()
+    output_dir = args.output_dir.resolve()
+    precheck_dir = args.precheck_dir.resolve()
+    if (
+        output_dir == precheck_dir
+        or output_dir in precheck_dir.parents
+        or precheck_dir in output_dir.parents
+    ):
+        raise RuntimeError("output-dir and precheck-dir must be separate, non-nested trees")
 
     if args.command == "precheck":
         configure_compatibility(args.compat_dir.resolve())
         run_precheck(args, tests)
         return
 
+    precheck_path = precheck_dir / "precheck-report.json"
+    if args.command == "seal":
+        _precheck, precheck_sha256 = precheck_evidence(precheck_path, tests)
+        for shard_index in range(SHARD_COUNT):
+            integrity.seal_shard_manifest(output_dir, tests, shard_index)
+        report = write_report(output_dir, precheck_path, precheck_sha256, tests, 0.0)
+        runner.log("CAPTURE COMPLETE: bounded results sealed")
+        runner.log(f"report: {report}")
+        return
+
     _complete, pending, remaining = print_plan(args, tests)
     if args.command == "plan":
         return
 
-    precheck_path = args.precheck_dir.resolve() / "precheck-report.json"
-    output_dir = args.output_dir.resolve()
     prebuilt_binary: Path | None = None
     if args.command == "full":
+        unsealed = integrity.unsealed_manifest_shards(output_dir, tests)
+        if unsealed:
+            raise RuntimeError("existing legacy manifests must be sealed before resume")
         if not args.yes_large:
             raise RuntimeError("inspect the plan, then pass --yes-large to start or resume")
         competing = competing_accuracy_processes()
@@ -486,7 +437,7 @@ def main() -> None:
 
     if args.command == "report":
         report = write_report(output_dir, precheck_path, precheck_sha256, tests, 0.0)
-        runner.log(f"FULL SWEEP PASS: {len(tests) * SHARD_COUNT} binaries")
+        runner.log(f"CAPTURE COMPLETE: {len(tests) * SHARD_COUNT} binaries")
         runner.log(f"report: {report}")
         return
 
@@ -515,7 +466,7 @@ def main() -> None:
         time.time() - started,
     )
     runner.log(
-        f"FULL SWEEP PASS: {len(tests) * SHARD_COUNT} binaries, "
+        f"CAPTURE COMPLETE: {len(tests) * SHARD_COUNT} binaries, "
         f"{SHARD_COUNT} shards, {len(tests)} concrete PTX instructions"
     )
     runner.log(f"report: {report}")

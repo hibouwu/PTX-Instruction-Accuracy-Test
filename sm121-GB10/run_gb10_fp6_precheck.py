@@ -338,6 +338,7 @@ def main() -> None:
         "compat_dir": str(args.compat_dir.resolve()),
         "host": platform.node(),
         "test_count": len(tests),
+        "matrix_sha256": runner.matrix_sha256(tests),
         "determinism_records_per_test": SAMPLE_RECORDS,
         "reference": reference_stats,
         "binary_bytes": sum(path.stat().st_size for path in output_dir.rglob("*.bin")),
