@@ -9,6 +9,21 @@
 5. 将输入和 masked 结果流式写入 `.bin`；
 6. 校验二进制文件结构，并可与已有参考目录逐位比较。
 
+每条展开后的具体 PTX 指令使用独立结果目录：
+
+```text
+results/
+└── <test-name>/
+    ├── <sweep-name>__shard-00000-of-00001.bin
+    └── ...
+```
+
+例如 `add.rn.f32.f16` 的结果位于：
+
+```text
+results/mixed_add__f16__rn__nosat/
+```
+
 图片中 Golden source 为 `Ref model` 的黑色行不在本脚本中。`.rs.bf16x2.f32` 也不属于 SM121 GB10，因此未生成。其余绿色 GB10 行展开后共 85 条具体指令。
 
 ## 常用命令
@@ -107,6 +122,8 @@ python3 run_gb10_ptx_accuracy.py \
 python3 run_gb10_ptx_accuracy.py \
   --reference-dir /path/to/reference/results
 ```
+
+参考目录需要使用相同的 `<test-name>/<sweep-name>__shard-...bin` 层级。根目录下的 manifest 使用相对路径索引各指令子目录中的二进制文件。
 
 涉及 `.s2f6x2` 以及 FP16/BF16 到 FP4/FP6 的 PTX 9.1 指令需要 CUDA 13.1 或更高版本。脚本会在编译前检查 `nvcc` 版本。
 

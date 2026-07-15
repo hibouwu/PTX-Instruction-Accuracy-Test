@@ -905,11 +905,14 @@ def execute_tests(
         start, count = shard_slice(sweep.count, shard_index, shard_count)
         if limit_records is not None:
             count = min(count, limit_records)
+        test_directory = Path(safe_name(test.name))
         filename = (
-            f"{safe_name(test.name)}__{safe_name(sweep.name)}__"
+            f"{safe_name(sweep.name)}__"
             f"shard-{shard_index:05d}-of-{shard_count:05d}.bin"
         )
-        output = output_dir / filename
+        relative_path = test_directory / filename
+        output = output_dir / relative_path
+        output.parent.mkdir(parents=True, exist_ok=True)
         command: list[object] = [binary, test_id, start, count, sweep.count]
         command.extend(range_args(sweep.a))
         command.extend(range_args(sweep.b))
@@ -917,9 +920,11 @@ def execute_tests(
         command.extend([chunk_records, output])
         run(command)
         summary = read_header(output)
-        summary.update({"ptx": test.ptx, "sweep": sweep.name, "file": filename})
+        summary.update(
+            {"ptx": test.ptx, "sweep": sweep.name, "file": relative_path.as_posix()}
+        )
         if reference_dir is not None:
-            compare_binary(output, reference_dir / filename)
+            compare_binary(output, reference_dir / relative_path)
             summary["comparison"] = "pass"
             log(f"PASS {test.name} / {sweep.name}")
         else:
