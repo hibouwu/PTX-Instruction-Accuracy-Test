@@ -182,30 +182,62 @@ PRECHECK PASS: 184 adversarial binaries, 24117248 lanes matched the independent 
 
 `f6x2type × fp16x2type × {.relu}` 展开为 8 条具体 PTX。每条遍历 `2^32` 个 packed 输入，单条约 64 GiB，全部约 512 GiB。建议固定使用 16 个分片，每次运行约 32 GiB。
 
-这些 PTX ISA 9.1 指令属于 `sm_120f` family-specific 特性。先进行 PTX-only 编译和单记录 JIT preflight：
+这些 PTX ISA 9.1 指令属于 `sm_120f` family-specific 特性。完成 precheck 后，正式全量测试可以直接在 GB10 本机离线运行；计算、JIT 和 `.bin` 写出不访问网络。
+
+先查看已完成分片、待运行分片和剩余容量：
 
 ```bash
-python3 run_gb10_fp6_precheck.py
+python3 run_gb10_fp6_full.py --plan
 ```
 
-只有统一实验前检查生成 `PASS` 报告后，才逐个执行全量分片。正式 runner 也必须继续加载 CUDA 13.1 compatibility 库：
+确认计划后，一条命令运行或续跑全部 16 个分片：
 
 ```bash
-export LD_LIBRARY_PATH=/usr/local/cuda-13.1/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-
-python3 run_gb10_ptx_accuracy.py --tests 'fp16x2_to_f6x2*' --arch compute_120f --profile full --shard-count 16 --shard-index 0 --yes-large
+python3 run_gb10_fp6_full.py --yes-large
 ```
 
-将 `--shard-index` 从 0 依次运行到 15。脚本会再次自动 preflight，并在磁盘不足时拒绝运行。
+`run_gb10_fp6_full.py` 会自动：
+
+1. 要求 `results/fp6-precheck/precheck-report.json` 为 `PASS`，并固定其 SHA-256 到最终报告；
+2. 加载 `/usr/local/cuda-13.1/compat`，无需手工设置 `LD_LIBRARY_PATH`；
+3. 检查剩余分片所需磁盘容量；
+4. 验证已有分片的 header、指令名、范围、记录数和文件长度，完整的分片直接跳过；
+5. 清理待重跑分片的残留 `.partial`，从缺失分片继续，而不是重写已经完成的约 4 GiB 文件；
+6. 串行运行每个 shard，单个 shard 完成后立即做 post-run 校验；
+7. 全部完成后确认 128 个 `.bin`、16 个 manifest、0 个 `.partial`，并写出 `results/fp6-full/full-run-report.json`。
+
+因此命令被终止、机器重启或某个 shard 失败后，只需再次运行同一条命令：
+
+```bash
+python3 run_gb10_fp6_full.py --yes-large
+```
+
+已经通过原始 runner 手工生成的完整 shard 也会被识别并跳过。只补跑指定范围，例如 shard 3：
+
+```bash
+python3 run_gb10_fp6_full.py \
+  --start-shard 3 \
+  --end-shard 3 \
+  --yes-large
+```
+
+成功结束必须看到：
+
+```text
+FULL SWEEP PASS: 128 binaries, 16 shards, 8 concrete PTX instructions
+```
+
+并确认：
+
+```bash
+python3 -c "import json; print(json.load(open('results/fp6-full/full-run-report.json'))['status'])"
+```
+
+输出应为 `PASS`。默认结果约 512 GiB；当前 GB10 的可用空间足够。建议在机器本机终端运行，并避免休眠或关机。若通过 SSH 启动，应放在 `tmux`/`screen` 中，避免连接中断终止前台任务。
+
+不要在原始 runner 或手工 shard 循环仍在运行时启动一键脚本；一键脚本也会检测已有 accuracy 进程并拒绝启动，避免两个进程同时写同一个 `.partial`。等待当前进程结束或中止后，再运行一键命令续跑。
 
 如果 precheck 报 `the provided PTX was compiled with an unsupported toolchain`，说明进程没有成功加载 CUDA 13.1 compatibility JIT，或当前驱动/toolkit 组合不兼容；不要开始全量任务。直接使用 `sm_121a`、`sm_121f` 或 `sm_120f` 生成 cubin 时，当前 ptxas 会以 feature not supported 拒绝这组指令。
-
-按 16 个分片运行完整输入空间中的第 3 个分片：
-
-```bash
-python3 run_gb10_ptx_accuracy.py \
-  --profile full --shard-count 16 --shard-index 3 --yes-large
-```
 
 与另一目录中的同名参考二进制逐位比较：
 

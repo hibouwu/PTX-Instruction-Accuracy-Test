@@ -39,6 +39,13 @@ python3 run_gb10_fp6_precheck.py
 
 该命令自动完成 CUDA 13.1 compatibility/JIT 检查、8 条具体 PTX preflight、smoke、65,536 条重复性比较、23 个边界分片，以及 E2M3/E3M2 独立软件参考逐 lane 校验。只有生成的 `results/fp6-precheck/precheck-report.json` 为 `PASS` 后才开始正式全量分片。详细说明见 [`sm121-GB10/README.md`](sm121-GB10/README.md)。
 
+通过 precheck 后，可在 GB10 本机断网运行或续跑全部 16 个分片：
+
+```bash
+cd /home/xp6/PTX-Instruction-Accuracy-Test/sm121-GB10
+python3 run_gb10_fp6_full.py --yes-large
+```
+
 ```bash
 cd /home/jianyeshi/Note/PTX-Instruction-Accuracy-Test/sm121-GB10
 
