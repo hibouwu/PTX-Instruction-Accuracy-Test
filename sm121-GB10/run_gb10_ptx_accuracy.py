@@ -17,12 +17,15 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import fnmatch
+import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -58,8 +61,11 @@ class ValueRange:
     def smoke(self) -> "ValueRange":
         if self.count <= 4:
             return self
-        span = self.maximum - self.start
-        return ValueRange(self.start, self.maximum, max(1, (span + 2) // 3))
+        # Preserve the original value lattice.  Replacing the stride from the
+        # numeric span made distinct full sweeps collapse to identical smoke
+        # inputs (for example ADD Test 1 and Test 2).
+        index_step = (self.count - 1 + 2) // 3
+        return ValueRange(self.start, self.maximum, self.stride * index_step)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,6 +105,7 @@ F32_PAIR = Sweep("f32-pair", U32, U32_SPARSE, FIXED_DEADBEEF)
 F32_PAIR_SCALED = Sweep("f32-pair-scale", U32, U32_SPARSE, SCALE_C)
 PACKED_B32 = Sweep("packed-b32", FIXED_ZERO, U32, FIXED_DEADBEEF)
 PACKED_B32_SCALED = Sweep("packed-b32-scale", FIXED_ZERO, U32, SCALE_C)
+PACKED_B32_FIXED_SCALE = Sweep("packed-b32-fixed-scale", FIXED_ZERO, U32, FIXED_DEADBEEF)
 PACKED_B16 = Sweep("packed-b16", FIXED_ZERO, U16, FIXED_DEADBEEF)
 PACKED_B16_SCALED = Sweep("packed-b16-scale", FIXED_ZERO, U16, SCALE_C)
 
@@ -116,10 +123,10 @@ FMA_SWEEPS = (
         ValueRange(0, 0xFFFFFFFF, 0x00FFFFFF),
     ),
     Sweep(
-        "a-full-b-sparse-c-sparse-fffff",
+        "a-full-b-sparse-c-sparse-ffff",
         U16,
         U16_SPARSE_FF,
-        ValueRange(0, 0xFFFFFFFF, 0x000FFFFF),
+        ValueRange(0, 0xFFFFFFFF, 0x0000FFFF),
     ),
 )
 
@@ -186,7 +193,10 @@ def build_tests() -> list[Test]:
                         tagged("fp16x2_to_f6x2", source, dtype, "relu" if relu else "norelu"),
                         ptx,
                         "packed32_h",
-                        0xFF,  # The table explicitly requests the low 8 bits.
+                        # e2m3x2/e3m2x2 use a b16 destination containing two
+                        # padded b8 lanes.  Keeping only 0xff silently drops
+                        # the upper lane.
+                        0xFFFF,
                         (PACKED_B32,),
                         (13, 1),
                     )
@@ -236,7 +246,10 @@ def build_tests() -> list[Test]:
                     ptx,
                     "packed32_h_scale" if scaled else "packed32_h",
                     0xFFFF,
-                    (PACKED_B32_SCALED if scaled else PACKED_B32,),
+                    # The table fixes Source C to 0xdeadbeef for this row, so
+                    # the optional scale operand is 0xdead rather than a full
+                    # 16-bit scale sweep.
+                    (PACKED_B32_FIXED_SCALE if scaled else PACKED_B32,),
                     (13, 1),
                 )
             )
@@ -276,7 +289,7 @@ def build_tests() -> list[Test]:
                         "packed16_r_scale",
                         0xFFFFFFFF,
                         (PACKED_B16_SCALED,),
-                        (13, 1),
+                        (13, 2),
                     )
                 )
 
@@ -332,7 +345,7 @@ def build_tests() -> list[Test]:
                     "packed8_r_scale",
                     0xFFFFFFFF,
                     (PACKED_B16_SCALED,),
-                    (13, 1),
+                    (13, 2),
                 )
             )
 
@@ -380,6 +393,45 @@ def build_tests() -> list[Test]:
 
 
 TESTS = build_tests()
+
+
+def validate_test_matrix(tests: Sequence[Test]) -> None:
+    if len(tests) != 85:
+        raise AssertionError(f"expected 85 concrete GB10 tests, found {len(tests)}")
+    names = [test.name for test in tests]
+    ptx = [test.ptx for test in tests]
+    if len(names) != len(set(names)):
+        raise AssertionError("duplicate test names")
+    if len(ptx) != len(set(ptx)):
+        raise AssertionError("duplicate concrete PTX instructions")
+    for test in tests:
+        if not 0 <= test.mask <= 0xFFFFFFFF:
+            raise AssertionError(f"invalid result mask for {test.name}")
+        if not test.sweeps:
+            raise AssertionError(f"test has no sweeps: {test.name}")
+        for sweep in test.sweeps:
+            for label, value_range in (
+                ("a", sweep.a),
+                ("b", sweep.b),
+                ("c", sweep.c),
+            ):
+                if value_range.start > value_range.maximum:
+                    raise AssertionError(f"{test.name}/{sweep.name}: {label} start > maximum")
+                if value_range.stride < 0:
+                    raise AssertionError(f"{test.name}/{sweep.name}: negative {label} stride")
+                if value_range.stride == 0 and value_range.start != value_range.maximum:
+                    raise AssertionError(
+                        f"{test.name}/{sweep.name}: zero {label} stride for non-fixed range"
+                    )
+            if not 0 < sweep.count <= 0xFFFFFFFFFFFFFFFF:
+                raise AssertionError(f"invalid sweep size: {test.name}/{sweep.name}")
+
+    fp6_outputs = [test for test in tests if test.name.startswith("fp16x2_to_f6x2__")]
+    if len(fp6_outputs) != 8 or any(test.mask != 0xFFFF for test in fp6_outputs):
+        raise AssertionError("FP16/BF16-to-FP6x2 must preserve both padded b8 lanes")
+
+
+validate_test_matrix(TESTS)
 
 
 CU_TEMPLATE = r'''
@@ -592,6 +644,11 @@ int main(int argc, char** argv) {
   }
 
   CUDA_CHECK(cudaFree(device_records));
+  output.flush();
+  if (!output) {
+    std::fprintf(stderr, "failed while flushing: %s\n", output_path);
+    return 5;
+  }
   output.close();
   std::printf("test=%s records=%llu output=%s\n", kTestNames[test_id],
               static_cast<unsigned long long>(shard_count), output_path);
@@ -747,18 +804,16 @@ def compile_cuda(
             f"but {nvcc} reports {actual[0]}.{actual[1]}"
         )
     binary.parent.mkdir(parents=True, exist_ok=True)
-    run(
-        [
-            nvcc,
-            "-O3",
-            "-std=c++17",
-            "-lineinfo",
-            f"-arch={arch}",
-            source,
-            "-o",
-            binary,
-        ]
-    )
+    command: list[object] = [nvcc, "-O3", "-std=c++17", "-lineinfo"]
+    if arch.startswith("compute_"):
+        # Embed family-specific PTX and defer stage-2 translation to the
+        # driver.  This is required for PTX features whose ISA notes name
+        # sm_*f but which ptxas cannot lower directly to the installed chip.
+        command.extend([f"--gpu-architecture={arch}", f"--gpu-code={arch}"])
+    else:
+        command.append(f"-arch={arch}")
+    command.extend([source, "-o", binary])
+    run(command)
 
 
 def select_tests(patterns: Sequence[str]) -> list[Test]:
@@ -785,6 +840,15 @@ def range_args(value_range: ValueRange) -> list[str]:
 
 def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
+def range_metadata(value_range: ValueRange) -> dict[str, int]:
+    return {
+        "start": value_range.start,
+        "maximum": value_range.maximum,
+        "stride": value_range.stride,
+        "count": value_range.count,
+    }
 
 
 def shard_slice(total: int, index: int, count: int) -> tuple[int, int]:
@@ -912,25 +976,61 @@ def execute_tests(
         )
         relative_path = test_directory / filename
         output = output_dir / relative_path
+        partial_output = output.with_suffix(output.suffix + ".partial")
         output.parent.mkdir(parents=True, exist_ok=True)
         command: list[object] = [binary, test_id, start, count, sweep.count]
         command.extend(range_args(sweep.a))
         command.extend(range_args(sweep.b))
         command.extend(range_args(sweep.c))
-        command.extend([chunk_records, output])
+        command.extend([chunk_records, partial_output])
         run(command)
-        summary = read_header(output)
+        summary = read_header(partial_output)
         summary.update(
-            {"ptx": test.ptx, "sweep": sweep.name, "file": relative_path.as_posix()}
+            {
+                "ptx": test.ptx,
+                "sweep": sweep.name,
+                "file": relative_path.as_posix(),
+                "ranges": {
+                    "source_a": range_metadata(sweep.a),
+                    "source_b": range_metadata(sweep.b),
+                    "source_c": range_metadata(sweep.c),
+                },
+            }
         )
         if reference_dir is not None:
-            compare_binary(output, reference_dir / relative_path)
+            compare_binary(partial_output, reference_dir / relative_path)
             summary["comparison"] = "pass"
             log(f"PASS {test.name} / {sweep.name}")
         else:
             summary["comparison"] = "golden-captured"
+        partial_output.replace(output)
         summaries.append(summary)
     return summaries
+
+
+def preflight_tests(binary: Path, tests: Sequence[Test]) -> None:
+    with tempfile.TemporaryDirectory(prefix="gb10-ptx-preflight-") as temporary:
+        temporary_dir = Path(temporary)
+        for test_id, test in enumerate(tests):
+            sweep = test.sweeps[0]
+            output = temporary_dir / f"{safe_name(test.name)}.bin"
+            command: list[object] = [binary, test_id, 0, 1, sweep.count]
+            command.extend(range_args(sweep.a))
+            command.extend(range_args(sweep.b))
+            command.extend(range_args(sweep.c))
+            command.extend([1, output])
+            try:
+                run(command)
+                header = read_header(output)
+            except Exception as error:
+                raise RuntimeError(
+                    f"preflight failed for {test.name} ({test.ptx}); "
+                    "do not start the full sweep until architecture, CUDA toolkit, "
+                    f"and driver compatibility are resolved: {error}"
+                ) from error
+            if header["test_name"] != test.name or header["shard_records"] != 1:
+                raise RuntimeError(f"invalid preflight output for {test.name}")
+            log(f"PREFLIGHT PASS {test.name}")
 
 
 def write_manifest(
@@ -941,7 +1041,17 @@ def write_manifest(
     shard_count: int,
     summaries: Sequence[dict[str, object]],
 ) -> Path:
-    manifest = output_dir / f"manifest-shard-{shard_index:05d}-of-{shard_count:05d}.json"
+    families = {test.name.split("__", 1)[0] for test in tests}
+    if len(families) == 1:
+        selection = safe_name(next(iter(families)))
+    elif len(tests) == len(TESTS):
+        selection = "all"
+    else:
+        digest = hashlib.sha256("\n".join(test.name for test in tests).encode()).hexdigest()[:12]
+        selection = f"selection-{digest}"
+    manifest = output_dir / (
+        f"manifest-{selection}__shard-{shard_index:05d}-of-{shard_count:05d}.json"
+    )
     payload = {
         "format": "GB10 PTX accuracy binary v1",
         "profile": profile,
@@ -954,9 +1064,37 @@ def write_manifest(
     return manifest
 
 
+def print_plan(
+    tests: Sequence[Test],
+    output_dir: Path,
+    profile: str,
+    shard_index: int,
+    shard_count: int,
+    limit_records: int | None,
+) -> None:
+    total_bytes = 0
+    for _test_id, test, sweep in selected_runs(tests, profile):
+        start, count = shard_slice(sweep.count, shard_index, shard_count)
+        if limit_records is not None:
+            count = min(count, limit_records)
+        size = HEADER_SIZE + count * RECORD_SIZE
+        total_bytes += size
+        filename = (
+            f"{safe_name(sweep.name)}__"
+            f"shard-{shard_index:05d}-of-{shard_count:05d}.bin"
+        )
+        print(f"{test.name}: {test.ptx}")
+        print(
+            f"  sweep={sweep.name} full_records={sweep.count} "
+            f"shard_start={start} shard_records={count} bytes={size}"
+        )
+        print(f"  output={output_dir / safe_name(test.name) / filename}")
+    print(f"tests={len(tests)} projected_bytes={total_bytes} projected_gib={total_bytes / 1024**3:.3f}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate, compile, and run all screenshot-listed GB10 PTX accuracy tests."
+        description="Generate, compile, and run all README-listed GB10 PTX accuracy tests."
     )
     parser.add_argument(
         "--tests",
@@ -966,9 +1104,15 @@ def parse_args() -> argparse.Namespace:
         help="select test name/PTX glob; repeatable (default: every GB10 row/variant)",
     )
     parser.add_argument("--list", action="store_true", help="list expanded tests and exit")
+    parser.add_argument("--plan", action="store_true", help="print ranges, shard sizes, and outputs")
     parser.add_argument("--profile", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--generate-only", action="store_true")
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="build and execute one temporary record per concrete PTX, then exit",
+    )
     parser.add_argument("--generated-dir", type=Path, default=DEFAULT_GENERATED_DIR)
     parser.add_argument("--build-dir", type=Path, default=DEFAULT_BUILD_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -999,8 +1143,15 @@ def main() -> None:
         raise RuntimeError("chunk-records must be positive")
     if args.limit_records is not None and args.limit_records < 0:
         raise RuntimeError("limit-records cannot be negative")
-    if args.reference_dir and args.output_dir.resolve() == args.reference_dir.resolve():
-        raise RuntimeError("output-dir and reference-dir must be different")
+    if args.reference_dir:
+        output_path = args.output_dir.resolve()
+        reference_path = args.reference_dir.resolve()
+        if (
+            output_path == reference_path
+            or output_path in reference_path.parents
+            or reference_path in output_path.parents
+        ):
+            raise RuntimeError("output-dir and reference-dir must be separate, non-nested trees")
 
     tests = select_tests(args.tests)
     if args.list:
@@ -1008,6 +1159,16 @@ def main() -> None:
             versions = f"CUDA {test.min_cuda[0]}.{test.min_cuda[1]}+"
             print(f"{index:03d} {test.name}\n    {test.ptx};  mask=0x{test.mask:08x}  {versions}")
         print(f"expanded tests: {len(tests)}")
+        return
+    if args.plan:
+        print_plan(
+            tests,
+            args.output_dir.resolve(),
+            args.profile,
+            args.shard_index,
+            args.shard_count,
+            args.limit_records,
+        )
         return
 
     source = generate_cuda(tests, args.generated_dir.resolve())
@@ -1020,6 +1181,10 @@ def main() -> None:
     log(f"built {binary}")
     if args.build_only:
         return
+    preflight_tests(binary, tests)
+    if args.preflight_only:
+        log(f"all {len(tests)} concrete PTX preflights passed")
+        return
 
     estimate = projected_bytes(
         tests,
@@ -1029,6 +1194,13 @@ def main() -> None:
         args.limit_records,
     )
     log(f"projected binary output: {estimate / 1024**3:.3f} GiB")
+    args.output_dir.resolve().mkdir(parents=True, exist_ok=True)
+    free_bytes = shutil.disk_usage(args.output_dir.resolve()).free
+    if estimate > free_bytes:
+        raise RuntimeError(
+            f"projected output requires {estimate} bytes, but output filesystem has "
+            f"only {free_bytes} bytes free"
+        )
     if estimate >= LARGE_OUTPUT_BYTES and not args.yes_large:
         raise RuntimeError(
             "projected output is at least 16 GiB; inspect the ranges/sharding and rerun with --yes-large"

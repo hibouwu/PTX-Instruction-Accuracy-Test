@@ -26,7 +26,7 @@
 | `cvt.rn.satfinite.f4x2type.f32 d, a, b;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C: `0xdeadbeef`<br>Only compare lower 16 bits of result | |
 | `cvt.{.rz,.rp}{.satfinite}.ue8m0x2.f32 d, a, b;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C: `0xdeadbeef`<br>Only compare lower 16 bits of result | |
 | `cvt.rn.satfinite{.relu}.scaled::n2::ue8m0.s2f6x2.f32 d, a, b, scale-factor;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C: `bit[31:16]`, range `0~0xFFFF`<br>Only compare lower 16 bits of result | |
-| `cvt.rs.satfinite.bf16x2.f32 d, a, b, rbits;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C (`Rbits`): lower 16 bits = higher 16 bits; range `0~0xFFFF` | |
+| `cvt.rs.satfinite.bf16x2.f32 d, a, b, rbits;` | SM110-THOR | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C (`Rbits`): lower 16 bits = higher 16 bits; range `0~0xFFFF` | SM121 unsupported |
 ```bash
 cd /home/jianyeshi/Note/PTX-Instruction-Accuracy-Test/sm121-GB10
 

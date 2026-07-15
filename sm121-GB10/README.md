@@ -1,6 +1,6 @@
 # SM121 GB10 PTX accuracy runner
 
-`run_gb10_ptx_accuracy.py` 是该平台的统一测试入口。它读取脚本内根据仓库三张截图整理的测试矩阵，完成：
+`run_gb10_ptx_accuracy.py` 是该平台的统一测试入口。它读取脚本内根据仓库根 README 表格整理的测试矩阵，完成：
 
 1. 将 `f6x2type`、`f4x2type`、`fp16x2type`、rounding 和可选 modifier 展开为具体 PTX 指令；
 2. 自动生成 `generated/gb10_ptx_accuracy_generated.cu`；
@@ -8,6 +8,8 @@
 4. 在 GB10 上分批执行测试；
 5. 将输入和 masked 结果流式写入 `.bin`；
 6. 校验二进制文件结构，并可与已有参考目录逐位比较。
+
+正式写结果前，脚本会对每条选中的具体 PTX 执行一条临时记录作为 preflight。架构、PTX JIT、CUDA toolkit 或驱动不兼容时会在产生大文件前停止。
 
 每条展开后的具体 PTX 指令使用独立结果目录：
 
@@ -24,7 +26,7 @@ results/
 results/mixed_add__f16__rn__nosat/
 ```
 
-图片中 Golden source 为 `Ref model` 的黑色行不在本脚本中。`.rs.bf16x2.f32` 也不属于 SM121 GB10，因此未生成。其余绿色 GB10 行展开后共 85 条具体指令。
+Golden source 为 `Ref model` 的行不在本脚本中。`.rs.bf16x2.f32` 也不属于 SM121 GB10，因此未生成。其余 GB10 行展开后共 85 条具体指令。
 
 ## 常用命令
 
@@ -50,6 +52,12 @@ python3 run_gb10_ptx_accuracy.py --build-only
 
 ```bash
 python3 run_gb10_ptx_accuracy.py
+```
+
+只查看实际范围、记录数、分片和预计输出，不生成或编译：
+
+```bash
+python3 run_gb10_ptx_accuracy.py --tests 'fp16x2_to_f6x2*' --profile full --shard-count 16 --shard-index 0 --plan
 ```
 
 筛选指令：
@@ -109,6 +117,26 @@ python3 run_gb10_ptx_accuracy.py \
   --yes-large
 ```
 
+## FP16/BF16 到 FP6x2 全量测试
+
+`f6x2type × fp16x2type × {.relu}` 展开为 8 条具体 PTX。每条遍历 `2^32` 个 packed 输入，单条约 64 GiB，全部约 512 GiB。建议固定使用 16 个分片，每次运行约 32 GiB。
+
+这些 PTX ISA 9.1 指令属于 `sm_120f` family-specific 特性。先进行 PTX-only 编译和单记录 JIT preflight：
+
+```bash
+python3 run_gb10_ptx_accuracy.py --tests 'fp16x2_to_f6x2*' --arch compute_120f --preflight-only
+```
+
+只有上述命令全部通过后，才逐个执行分片：
+
+```bash
+python3 run_gb10_ptx_accuracy.py --tests 'fp16x2_to_f6x2*' --arch compute_120f --profile full --shard-count 16 --shard-index 0 --yes-large
+```
+
+将 `--shard-index` 从 0 依次运行到 15。脚本会再次自动 preflight，并在磁盘不足时拒绝运行。
+
+如果 preflight 报 `the provided PTX was compiled with an unsupported toolchain`，说明驱动无法 JIT 当前 toolkit 生成的 PTX，必须先升级到兼容的驱动/toolkit 组合；不要开始全量任务。直接使用 `sm_121a`、`sm_121f` 或 `sm_120f` 生成 cubin 时，当前 ptxas 会以 feature not supported 拒绝这组指令。
+
 按 16 个分片运行完整输入空间中的第 3 个分片：
 
 ```bash
@@ -125,7 +153,7 @@ python3 run_gb10_ptx_accuracy.py \
 
 参考目录需要使用相同的 `<test-name>/<sweep-name>__shard-...bin` 层级。根目录下的 manifest 使用相对路径索引各指令子目录中的二进制文件。
 
-涉及 `.s2f6x2` 以及 FP16/BF16 到 FP4/FP6 的 PTX 9.1 指令需要 CUDA 13.1 或更高版本。脚本会在编译前检查 `nvcc` 版本。
+涉及 `.s2f6x2` 以及 FP16/BF16 到 FP4/FP6 的 PTX 9.1 指令需要 CUDA 13.1 或更高版本。`bf16x2 <- f6x2/f4x2` 属于 PTX ISA 9.2，需要 CUDA 13.2 或更高版本。脚本会在编译前检查 `nvcc` 版本。
 
 ## 二进制格式
 
@@ -141,4 +169,14 @@ Record:
 
 Header 保存格式版本、具体指令名、result mask、完整 sweep 记录数以及当前分片的起点和记录数。脚本会验证文件大小与 header 一致，并输出一个小型 JSON manifest 便于索引 `.bin` 文件。
 
+结果先写入 `.bin.partial`，仅在 header 和文件长度验证成功后原子替换最终 `.bin`。manifest 名包含测试族，避免不同指令选择在相同 shard 上互相覆盖；manifest 同时记录 A/B/C 的完整范围。
+
 未提供 `--reference-dir` 时，GB10 本身是表格指定的 golden source，因此脚本执行的是 golden capture 与完整性检查，不会把同一条硬件指令的输出伪装成独立 reference。提供参考目录后，任何 bit mismatch 都会返回非零退出码并报告首个不一致字节。
+
+## CPU 合约测试
+
+```bash
+python3 -m unittest -v test_run_gb10_ptx_accuracy.py
+```
+
+该测试固定检查表格展开数量、FP6x2 双 lane mask、ADD/FMA stride、scaled 输入、smoke 采样、分片无缝覆盖、manifest 防覆盖和全量容量估算。
