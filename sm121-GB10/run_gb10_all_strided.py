@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Precheck, run, resume, and report the feasible GB10 conversion sweeps.
+"""Precheck, run, resume, and report every strided GB10 PTX sweep.
 
-This single operational entry point covers the CUDA 13.1 conversion families
-whose complete README-defined input spaces fit on the GB10 test machine.  It
+This single operational entry point covers all CUDA-toolkit-supported GB10
+rows after applying the global README strides (u32: 0xffffff, u16: 0xff).  It
 reuses the generic CUDA generator/runner, but owns the complete workflow:
 
     precheck -> plan -> full/resume -> report
 
-The global strided full capture is only a few MiB.  It is a structurally validated GB10
-golden capture; the bounded precheck proves JIT execution and determinism, not
-agreement with an independent numerical reference model.
+The CUDA 13.1 matrix is approximately 12.85 GiB.  It is a structurally
+validated GB10 golden capture; the precheck proves JIT execution and
+determinism, not agreement with an independent numerical reference model.
 """
 
 from __future__ import annotations
@@ -32,70 +32,79 @@ ROOT = Path(__file__).resolve().parent
 # compute_120f/compute_121f target is intentionally rejected by ptxas.
 ARCH = "compute_121a"
 SHARD_COUNT = 16
-TEST_PATTERNS = (
-    "fp16x2_to_f4x2*",
-    "bf16x2_to_ue8m0x2*",
-    "bf16x2_to_s2f6x2*",
-    "f6x2_to_f16x2*",
-    "f4x2_to_f16x2*",
-    "s2f6x2_to_bf16x2_scaled*",
-    "ue8m0x2_to_bf16x2*",
-)
-EXPECTED_TESTS = 20
-DEFAULT_PRECHECK_DIR = ROOT / "results" / "bounded-conversions-strided-precheck"
-DEFAULT_OUTPUT_DIR = ROOT / "results" / "bounded-conversions-strided-full"
+SUPPORTED_CUDA_VERSIONS = {(13, 1), (13, 2)}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the globally strided full sweep for 20 bounded GB10 "
-            "FP4/UE8M0/S2F6 and inverse conversion instructions."
+            "Run every README-listed GB10 test supported by the selected CUDA toolkit."
         )
     )
     parser.add_argument("command", choices=("precheck", "plan", "full", "report"))
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--precheck-dir", type=Path, default=DEFAULT_PRECHECK_DIR)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--precheck-dir", type=Path)
+    parser.add_argument(
+        "--cuda-version",
+        choices=("13.1", "13.2"),
+        default="13.1",
+        help="select the PTX matrix supported by this toolkit",
+    )
     parser.add_argument("--nvcc", default="/usr/local/cuda/bin/nvcc")
     parser.add_argument(
         "--compat-dir",
         type=Path,
-        default=Path("/usr/local/cuda-13.1/compat"),
+        help="CUDA compatibility library directory; defaults from --cuda-version",
     )
     parser.add_argument("--start-shard", type=int, default=0)
     parser.add_argument("--end-shard", type=int, default=SHARD_COUNT - 1)
     parser.add_argument(
         "--overwrite-precheck",
         action="store_true",
-        help="replace an existing bounded-conversion precheck directory",
+        help="replace an existing all-strided precheck directory",
     )
     parser.add_argument(
         "--yes-large",
         action="store_true",
-        help="confirm generation of the complete globally strided golden data",
+        help="confirm generation of the complete strided golden data",
     )
     return parser.parse_args()
 
 
-def selected_tests() -> list[runner.Test]:
-    tests = runner.select_tests(TEST_PATTERNS)
-    if len(tests) != EXPECTED_TESTS:
-        raise RuntimeError(
-            f"bounded conversion matrix changed: expected {EXPECTED_TESTS} tests, "
-            f"found {len(tests)}"
-        )
-    if any(test.min_cuda > (13, 1) for test in tests):
-        raise RuntimeError("bounded conversion selection unexpectedly requires CUDA 13.2+")
-    if any(len(test.sweeps) != 1 for test in tests):
-        raise RuntimeError("bounded conversion workflow requires exactly one sweep per test")
+def cuda_version(value: str) -> tuple[int, int]:
+    version = tuple(int(part) for part in value.split("."))
+    if version not in SUPPORTED_CUDA_VERSIONS:
+        raise RuntimeError(f"unsupported CUDA matrix: {value}")
+    return version  # type: ignore[return-value]
+
+
+def selected_tests(version: tuple[int, int]) -> list[runner.Test]:
+    tests = [test for test in runner.TESTS if test.min_cuda <= version]
+    expected = 73 if version == (13, 1) else 85
+    if len(tests) != expected:
+        raise RuntimeError(f"expected {expected} tests for CUDA {version}, found {len(tests)}")
     return tests
+
+
+def full_runs(tests: Sequence[runner.Test]) -> list[tuple[runner.Test, runner.Sweep]]:
+    return [(test, sweep) for _test_id, test, sweep in runner.selected_runs(tests, "full")]
+
+
+def default_paths(args: argparse.Namespace, version: tuple[int, int]) -> None:
+    label = f"cuda{version[0]}.{version[1]}"
+    if args.output_dir is None:
+        args.output_dir = ROOT / "results" / f"all-strided-{label}-full"
+    if args.precheck_dir is None:
+        args.precheck_dir = ROOT / "results" / f"all-strided-{label}-precheck"
+    if args.compat_dir is None:
+        args.compat_dir = Path(f"/usr/local/cuda-{version[0]}.{version[1]}/compat")
 
 
 def configure_compatibility(compat_dir: Path) -> None:
     if not compat_dir.is_dir():
         raise RuntimeError(
             f"CUDA compatibility directory is missing: {compat_dir}; "
-            "install cuda-compat-13-1 before running PTX 9.1 instructions"
+            "install the matching cuda-compat package before running PTX JIT instructions"
         )
     if not any(compat_dir.glob("libnvidia-ptxjitcompiler.so*")):
         raise RuntimeError(f"PTX JIT compatibility library is missing from {compat_dir}")
@@ -117,7 +126,7 @@ def selected_shards(args: argparse.Namespace) -> range:
 
 def build_runner(tests: Sequence[runner.Test], nvcc: str) -> Path:
     source = runner.generate_cuda(tests, runner.DEFAULT_GENERATED_DIR)
-    binary = runner.DEFAULT_BUILD_DIR / "gb10_bounded_conversions"
+    binary = runner.DEFAULT_BUILD_DIR / "gb10_all_strided"
     runner.log(f"generated {source} ({len(tests)} concrete instructions)")
     runner.compile_cuda(source, binary, tests, nvcc, ARCH)
     runner.log(f"built {binary}")
@@ -152,8 +161,7 @@ def compare_capture_trees(
 ) -> tuple[int, int]:
     files = 0
     bytes_compared = 0
-    for test in tests:
-        sweep = test.sweeps[0].smoke()
+    for _test_id, test, sweep in runner.selected_runs(tests, "smoke"):
         relative = (
             Path(runner.safe_name(test.name))
             / f"{runner.safe_name(sweep.name)}__shard-00000-of-00001.bin"
@@ -189,6 +197,7 @@ def run_precheck(args: argparse.Namespace, tests: Sequence[runner.Test]) -> Path
         "arch": ARCH,
         "compat_dir": str(args.compat_dir.resolve()),
         "test_count": len(tests),
+        "sweep_count": len(full_runs(tests)),
         "tests": [test.name for test in tests],
         "determinism_files": files,
         "determinism_bytes": bytes_compared,
@@ -211,14 +220,15 @@ def precheck_evidence(
     if not path.is_file():
         raise RuntimeError(
             f"precheck report is missing: {path}; run "
-            "run_gb10_bounded_conversions.py precheck first"
+            "run_gb10_all_strided.py precheck first"
         )
     raw = path.read_bytes()
     report = json.loads(raw)
     expected_names = [test.name for test in tests]
     if (
         report.get("status") != "PASS"
-        or report.get("test_count") != EXPECTED_TESTS
+        or report.get("test_count") != len(tests)
+        or report.get("sweep_count") != len(full_runs(tests))
         or report.get("tests") != expected_names
     ):
         raise RuntimeError(f"precheck report is not a complete PASS: {path}")
@@ -228,9 +238,9 @@ def precheck_evidence(
 def expected_path(
     output_dir: Path,
     test: runner.Test,
+    sweep: runner.Sweep,
     shard_index: int,
 ) -> Path:
-    sweep = test.sweeps[0]
     return (
         output_dir
         / runner.safe_name(test.name)
@@ -241,10 +251,14 @@ def expected_path(
     )
 
 
-def result_complete(path: Path, test: runner.Test, shard_index: int) -> bool:
+def result_complete(
+    path: Path,
+    test: runner.Test,
+    sweep: runner.Sweep,
+    shard_index: int,
+) -> bool:
     if not path.is_file():
         return False
-    sweep = test.sweeps[0]
     start, count = runner.shard_slice(sweep.count, shard_index, SHARD_COUNT)
     try:
         header = runner.read_header(path)
@@ -265,8 +279,13 @@ def shard_complete(
     shard_index: int,
 ) -> bool:
     return all(
-        result_complete(expected_path(output_dir, test, shard_index), test, shard_index)
-        for test in tests
+        result_complete(
+            expected_path(output_dir, test, sweep, shard_index),
+            test,
+            sweep,
+            shard_index,
+        )
+        for test, sweep in full_runs(tests)
     )
 
 
@@ -275,8 +294,8 @@ def remove_stale_partials(
     tests: Sequence[runner.Test],
     shard_index: int,
 ) -> None:
-    for test in tests:
-        partial = expected_path(output_dir, test, shard_index).with_suffix(".bin.partial")
+    for test, sweep in full_runs(tests):
+        partial = expected_path(output_dir, test, sweep, shard_index).with_suffix(".bin.partial")
         if partial.exists():
             runner.log(f"removing stale partial before resume: {partial}")
             partial.unlink()
@@ -357,9 +376,8 @@ def write_existing_manifest(
     shard_index: int,
 ) -> Path:
     summaries: list[dict[str, object]] = []
-    for test in tests:
-        sweep = test.sweeps[0]
-        path = expected_path(output_dir, test, shard_index)
+    for test, sweep in full_runs(tests):
+        path = expected_path(output_dir, test, sweep, shard_index)
         summary = runner.read_header(path)
         summary.update(
             {
@@ -390,17 +408,18 @@ def validate_all(
     tests: Sequence[runner.Test],
 ) -> tuple[list[Path], list[Path]]:
     binaries = [
-        expected_path(output_dir, test, shard_index)
+        expected_path(output_dir, test, sweep, shard_index)
         for shard_index in range(SHARD_COUNT)
-        for test in tests
+        for test, sweep in full_runs(tests)
     ]
     invalid = [
         path
         for shard_index in range(SHARD_COUNT)
-        for test in tests
+        for test, sweep in full_runs(tests)
         if not result_complete(
-            path := expected_path(output_dir, test, shard_index),
+            path := expected_path(output_dir, test, sweep, shard_index),
             test,
+            sweep,
             shard_index,
         )
     ]
@@ -431,6 +450,7 @@ def write_report(
         "arch": ARCH,
         "shard_count": SHARD_COUNT,
         "test_count": len(tests),
+        "sweep_count": len(full_runs(tests)),
         "tests": [{"name": test.name, "ptx": test.ptx} for test in tests],
         "binary_count": len(binaries),
         "binary_bytes": sum(path.stat().st_size for path in binaries),
@@ -446,7 +466,9 @@ def write_report(
 
 def main() -> None:
     args = parse_args()
-    tests = selected_tests()
+    version = cuda_version(args.cuda_version)
+    default_paths(args, version)
+    tests = selected_tests(version)
 
     if args.command == "precheck":
         configure_compatibility(args.compat_dir.resolve())
@@ -480,13 +502,15 @@ def main() -> None:
             )
         configure_compatibility(args.compat_dir.resolve())
         if not precheck_path.is_file():
-            runner.log("bounded precheck report is missing; running precheck automatically")
+            runner.log("all-strided precheck report is missing; running precheck automatically")
             prebuilt_binary = run_precheck(args, tests)
     _precheck, precheck_sha256 = precheck_evidence(precheck_path, tests)
 
     if args.command == "report":
         report = write_report(output_dir, precheck_path, precheck_sha256, tests, 0.0)
-        runner.log(f"FULL SWEEP PASS: {len(tests) * SHARD_COUNT} binaries")
+        runner.log(
+            f"FULL SWEEP PASS: {len(full_runs(tests)) * SHARD_COUNT} binaries"
+        )
         runner.log(f"report: {report}")
         return
 
@@ -495,7 +519,7 @@ def main() -> None:
         binary = prebuilt_binary or build_runner(tests, str(nvcc))
         for position, shard_index in enumerate(pending, 1):
             runner.log(
-                f"=== bounded full shard {shard_index}/{SHARD_COUNT - 1} "
+                f"=== all-strided full shard {shard_index}/{SHARD_COUNT - 1} "
                 f"(pending {position}/{len(pending)}) ==="
             )
             remove_stale_partials(output_dir, tests, shard_index)
@@ -515,8 +539,9 @@ def main() -> None:
         time.time() - started,
     )
     runner.log(
-        f"FULL SWEEP PASS: {len(tests) * SHARD_COUNT} binaries, "
-        f"{SHARD_COUNT} shards, {len(tests)} concrete PTX instructions"
+        f"FULL SWEEP PASS: {len(full_runs(tests)) * SHARD_COUNT} binaries, "
+        f"{SHARD_COUNT} shards, {len(tests)} concrete PTX instructions, "
+        f"{len(full_runs(tests))} sweeps"
     )
     runner.log(f"report: {report}")
 

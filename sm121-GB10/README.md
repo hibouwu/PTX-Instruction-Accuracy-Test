@@ -1,347 +1,179 @@
 # SM121 GB10 PTX accuracy runner
 
-`run_gb10_ptx_accuracy.py` 是该平台的统一测试入口。它读取脚本内根据仓库根 README 表格整理的测试矩阵，完成：
-
-1. 将 `f6x2type`、`f4x2type`、`fp16x2type`、rounding 和可选 modifier 展开为具体 PTX 指令；
-2. 自动生成 `generated/gb10_ptx_accuracy_generated.cu`；
-3. 使用 `nvcc -arch=sm_121a` 编译；
-4. 在 GB10 上分批执行测试；
-5. 将输入和 masked 结果流式写入 `.bin`；
-6. 校验二进制文件结构，并可与已有参考目录逐位比较。
-
-正式写结果前，脚本会对每条选中的具体 PTX 执行一条临时记录作为 preflight。架构、PTX JIT、CUDA toolkit 或驱动不兼容时会在产生大文件前停止。
-
-每条展开后的具体 PTX 指令使用独立结果目录：
+本目录使用统一 stride 规范生成 GB10 golden data：
 
 ```text
-results/
-└── <test-name>/
-    ├── <sweep-name>__shard-00000-of-00001.bin
-    └── ...
+0~0xFFFFFFFF: stride = 0xFFFFFF
+0~0xFFFF:     stride = 0xFF
 ```
 
-例如 `add.rn.f32.f16` 的结果位于：
+`ValueRange` 会在 stride 未自然落到最大值时额外包含终点，因此两种范围都包含 258 个值。存放在 `source_c[31:16]` 的 scale-factor 使用物理 stride `0x00FF0000`，对应逻辑 16-bit scale stride `0xFF`。
+
+## 推荐入口：全部 strided 测试
+
+`run_gb10_all_strided.py` 是正式运行入口，自动完成：
+
+1. 按 Toolkit 版本选择可编译的具体 PTX；
+2. 生成一个 CUDA runner 并编译为 `compute_121a` PTX；
+3. 加载对应 CUDA compatibility JIT；
+4. 对每条具体 PTX 执行单记录 preflight；
+5. 两次执行 smoke 并逐字节验证确定性；
+6. 按 16 个分片运行或续跑全部 sweep；
+7. 校验 header、范围、文件长度、manifest 和 `.partial`；
+8. 生成最终 `full-run-report.json`。
+
+CUDA 13.1 当前覆盖：
 
 ```text
-results/mixed_add__f16__rn__nosat/
+73 条具体 PTX
+125 个 sweep
+16 个分片
+约 12.846 GiB
 ```
 
-Golden source 为 `Ref model` 的行不在本脚本中。`.rs.bf16x2.f32` 也不属于 SM121 GB10，因此未生成。其余 GB10 行展开后共 85 条具体指令。
-
-## 常用命令
-
-列出所有展开后的测试：
-
-```bash
-python3 run_gb10_ptx_accuracy.py --list
-```
-
-只生成 CUDA 源码：
-
-```bash
-python3 run_gb10_ptx_accuracy.py --generate-only
-```
-
-生成并编译：
-
-```bash
-python3 run_gb10_ptx_accuracy.py --build-only
-```
-
-默认 smoke 测试：
-
-```bash
-python3 run_gb10_ptx_accuracy.py
-```
-
-只查看实际范围、记录数、分片和预计输出，不生成或编译：
-
-```bash
-python3 run_gb10_ptx_accuracy.py --tests 'fp16x2_to_f6x2*' --profile full --shard-count 16 --shard-index 0 --plan
-```
-
-筛选指令：
-
-```bash
-python3 run_gb10_ptx_accuracy.py --tests 'f32_to_f6x2*'
-```
-
-## 只测试一条指令
-
-先查看全部展开后的测试名称：
-
-```bash
-python3 run_gb10_ptx_accuracy.py --list
-```
-
-例如，只测试下面这条指令：
-
-```ptx
-cvt.rn.satfinite.e2m3x2.f32
-```
-
-可以使用测试名称：
-
-```bash
-python3 run_gb10_ptx_accuracy.py \
-  --tests 'f32_to_f6x2__e2m3x2'
-```
-
-也可以直接使用完整 PTX 指令名：
-
-```bash
-python3 run_gb10_ptx_accuracy.py \
-  --tests 'cvt.rn.satfinite.e2m3x2.f32'
-```
-
-上述命令默认只执行该指令的 smoke 测试。只生成或只编译这一条指令：
-
-```bash
-python3 run_gb10_ptx_accuracy.py \
-  --tests 'f32_to_f6x2__e2m3x2' \
-  --generate-only
-
-python3 run_gb10_ptx_accuracy.py \
-  --tests 'f32_to_f6x2__e2m3x2' \
-  --build-only
-```
-
-对这一条指令执行完整范围中的一个分片：
-
-```bash
-python3 run_gb10_ptx_accuracy.py \
-  --tests 'f32_to_f6x2__e2m3x2' \
-  --profile full \
-  --shard-count 16 \
-  --shard-index 0 \
-  --yes-large
-```
-
-## FP16/BF16 到 FP6x2：正式实验前检查
-
-`run_gb10_fp6_precheck.py` 是这组 PTX 9.1 指令在正式全量测试前的唯一检查入口：
-
-```ptx
-cvt.rn.satfinite{.relu}.{e2m3x2/e3m2x2}.{f16x2/bf16x2}
-```
-
-它只生成/编译一次 CUDA runner，然后自动执行：
-
-1. 检查 `/usr/local/cuda-13.1/compat` 中的新版 PTX JIT，并将其加入子进程的 `LD_LIBRARY_PATH`；
-2. 使用 `compute_120f` 生成 family-specific PTX，对 8 条具体指令执行单记录编译/JIT preflight；
-3. 捕获 smoke 结果并校验二进制结构；
-4. 对每条指令运行两次 65,536 条连续记录并逐字节比较；
-5. 选择 23 个 FP16/BF16 上半 lane 边界模式，每个模式穷举下半 lane 的全部 65,536 种编码；
-6. 使用独立 CPU 模型验证 RN ties-to-even、E2M3/E3M2 编码、`satfinite`、`.relu`、NaN、无穷、次正规数、负零、双 lane 位置和 padding 位；
-7. 写出 `precheck-report.json`。任何阶段失败都会返回非零退出码，不应开始正式全量测试。
-
-安装 `cuda-compat-13-1` 后直接运行：
+查看计划：
 
 ```bash
 cd /home/xp6/PTX-Instruction-Accuracy-Test/sm121-GB10
-python3 run_gb10_fp6_precheck.py
+python3 run_gb10_all_strided.py plan
 ```
 
-只查看阶段、预计容量和输出位置：
+一条命令运行或续跑；首次运行会自动先做 precheck：
 
 ```bash
-python3 run_gb10_fp6_precheck.py --plan
+python3 run_gb10_all_strided.py full --yes-large
 ```
 
-默认输出约 200 MiB，位于：
-
-```text
-results/fp6-precheck/
-├── smoke/
-├── determinism/
-│   ├── baseline/
-│   └── repeat/
-├── adversarial/
-└── precheck-report.json
-```
-
-默认不会覆盖已有检查证据。确认需要重新运行时使用：
+只跑指定分片：
 
 ```bash
-python3 run_gb10_fp6_precheck.py --overwrite
-```
-
-成功结束时必须同时看到：
-
-```text
-PRECHECK PASS: 184 adversarial binaries, 24117248 lanes matched the independent reference
-```
-
-并确认 `precheck-report.json` 中：
-
-```json
-"status": "PASS"
-```
-
-## FP16/BF16 到 FP6x2 全量测试
-
-`f6x2type × fp16x2type × {.relu}` 展开为 8 条具体 PTX。每条遍历 `2^32` 个 packed 输入，单条约 64 GiB，全部约 512 GiB。建议固定使用 16 个分片，每次运行约 32 GiB。
-
-这些 PTX ISA 9.1 指令属于 `sm_120f` family-specific 特性。完成 precheck 后，正式全量测试可以直接在 GB10 本机离线运行；计算、JIT 和 `.bin` 写出不访问网络。
-
-先查看已完成分片、待运行分片和剩余容量：
-
-```bash
-python3 run_gb10_fp6_full.py --plan
-```
-
-确认计划后，一条命令运行或续跑全部 16 个分片：
-
-```bash
-python3 run_gb10_fp6_full.py --yes-large
-```
-
-`run_gb10_fp6_full.py` 会自动：
-
-1. 要求 `results/fp6-precheck/precheck-report.json` 为 `PASS`，并固定其 SHA-256 到最终报告；
-2. 加载 `/usr/local/cuda-13.1/compat`，无需手工设置 `LD_LIBRARY_PATH`；
-3. 检查剩余分片所需磁盘容量；
-4. 验证已有分片的 header、指令名、范围、记录数和文件长度，完整的分片直接跳过；
-5. 清理待重跑分片的残留 `.partial`，从缺失分片继续，而不是重写已经完成的约 4 GiB 文件；
-6. 串行运行每个 shard，单个 shard 完成后立即做 post-run 校验；
-7. 全部完成后确认 128 个 `.bin`、16 个 manifest、0 个 `.partial`，并写出 `results/fp6-full/full-run-report.json`。
-
-因此命令被终止、机器重启或某个 shard 失败后，只需再次运行同一条命令：
-
-```bash
-python3 run_gb10_fp6_full.py --yes-large
-```
-
-已经通过原始 runner 手工生成的完整 shard 也会被识别并跳过。只补跑指定范围，例如 shard 3：
-
-```bash
-python3 run_gb10_fp6_full.py \
+python3 run_gb10_all_strided.py full \
   --start-shard 3 \
   --end-shard 3 \
   --yes-large
 ```
 
-成功结束必须看到：
-
-```text
-FULL SWEEP PASS: 128 binaries, 16 shards, 8 concrete PTX instructions
-```
-
-并确认：
+验证已有结果并重新生成报告：
 
 ```bash
-python3 -c "import json; print(json.load(open('results/fp6-full/full-run-report.json'))['status'])"
-```
-
-输出应为 `PASS`。默认结果约 512 GiB；当前 GB10 的可用空间足够。建议在机器本机终端运行，并避免休眠或关机。若通过 SSH 启动，应放在 `tmux`/`screen` 中，避免连接中断终止前台任务。
-
-不要在原始 runner 或手工 shard 循环仍在运行时启动一键脚本；一键脚本也会检测已有 accuracy 进程并拒绝启动，避免两个进程同时写同一个 `.partial`。等待当前进程结束或中止后，再运行一键命令续跑。
-
-如果 precheck 报 `the provided PTX was compiled with an unsupported toolchain`，说明进程没有成功加载 CUDA 13.1 compatibility JIT，或当前驱动/toolkit 组合不兼容；不要开始全量任务。直接使用 `sm_121a`、`sm_121f` 或 `sm_120f` 生成 cubin 时，当前 ptxas 会以 feature not supported 拒绝这组指令。
-
-与另一目录中的同名参考二进制逐位比较：
-
-```bash
-python3 run_gb10_ptx_accuracy.py \
-  --reference-dir /path/to/reference/results
-```
-
-参考目录需要使用相同的 `<test-name>/<sweep-name>__shard-...bin` 层级。根目录下的 manifest 使用相对路径索引各指令子目录中的二进制文件。
-
-## FP4、UE8M0 与其他有限空间转换全量测试
-
-`run_gb10_bounded_conversions.py` 是以下 20 条 CUDA 13.1 可用转换指令的唯一操作入口：
-
-```text
-fp16x2_to_f4x2*                 4 条，每条 2^32 个输入
-bf16x2_to_ue8m0x2*             4 条，每条 2^32 个输入
-bf16x2_to_s2f6x2*              4 条，每条 2^32 个输入
-s2f6x2_to_bf16x2_scaled*       4 条，每条 2^32 个输入
-f6x2_to_f16x2*                 2 条，每条 2^16 个输入
-f4x2_to_f16x2*                 1 条，每条 2^16 个输入
-ue8m0x2_to_bf16x2*             1 条，每条 2^16 个输入
-```
-
-完整结果约 1,024.004 GiB，固定划分为 16 个分片；每个分片约 64 GiB，共生成 320 个 `.bin`。先执行统一 precheck：
-
-该批次固定使用 `compute_121a` 生成 application-specific PTX，因为 `.s2f6x2` 在 GB10 上属于 SM121 application-specific 特性；`compute_120f` 或 `compute_121f` 会被 PTX 汇编器正确拒绝。
-
-```bash
-cd /home/xp6/PTX-Instruction-Accuracy-Test/sm121-GB10
-python3 run_gb10_bounded_conversions.py precheck
-```
-
-该步骤自动加载 CUDA 13.1 compatibility JIT、生成并编译一次 CUDA runner、对 20 条具体 PTX 执行 preflight，并重复捕获 smoke 数据进行逐字节确定性比较。已有 precheck 默认不会被覆盖；确需重跑时使用：
-
-```bash
-python3 run_gb10_bounded_conversions.py precheck --overwrite-precheck
-```
-
-查看完整计划、已有分片和剩余容量：
-
-```bash
-python3 run_gb10_bounded_conversions.py plan
-```
-
-precheck 为 `PASS` 后，一条命令离线运行或续跑全部分片：
-
-```bash
-python3 run_gb10_bounded_conversions.py full --yes-large
-```
-
-中断后执行同一命令即可跳过完整分片并继续。也可只跑指定分片，例如 shard 3：
-
-```bash
-python3 run_gb10_bounded_conversions.py full \
-  --start-shard 3 \
-  --end-shard 3 \
-  --yes-large
-```
-
-全部数据已经存在时，可只验证 320 个二进制、16 个 manifest、0 个 `.partial`，并重新生成最终 JSON 报告：
-
-```bash
-python3 run_gb10_bounded_conversions.py report
+python3 run_gb10_all_strided.py report
 ```
 
 默认输出：
 
 ```text
-results/bounded-conversions-precheck/
+results/all-strided-cuda13.1-precheck/
 └── precheck-report.json
 
-results/bounded-conversions-full/
+results/all-strided-cuda13.1-full/
 ├── full-run-report.json
 ├── manifest-*.json
-└── <test-name>/*.bin
+└── <test-name>/<sweep>__shard-*.bin
 ```
 
-这组 precheck 验证 PTX 编译/JIT、二进制结构和同一硬件重复运行的一致性。没有提供独立数值参考模型，因此最终报告明确标记为 GB10 golden capture，不能表述为独立 reference 精度比较通过。
+CUDA 13.2 下，同一脚本会加入 PTX ISA 9.2 的 F6/F4 → BF16 scaled 变体，共 85 条具体 PTX、137 个 sweep：
 
-涉及 `.s2f6x2` 以及 FP16/BF16 到 FP4/FP6 的 PTX 9.1 指令需要 CUDA 13.1 或更高版本。`bf16x2 <- f6x2/f4x2` 属于 PTX ISA 9.2，需要 CUDA 13.2 或更高版本。脚本会在编译前检查 `nvcc` 版本。
+```bash
+python3 run_gb10_all_strided.py plan --cuda-version 13.2
+python3 run_gb10_all_strided.py full --cuda-version 13.2 --yes-large
+```
+
+需要安装 CUDA Toolkit 13.2，并通过 `--compat-dir` 指定匹配的 compatibility JIT（若默认目录不可用）。CUDA 13.1 的 compatibility package 不能让 CUDA 13.1 `nvcc/ptxas` 获得 PTX ISA 9.2 支持。
+
+## 独立输出目录保护旧结果
+
+历史 FP6 与 bounded 结果使用 stride 1，是新稀疏输入集合的严格超集，仍保留为历史证据：
+
+```text
+results/fp6-full/
+results/fp6-precheck/
+results/bounded-conversions-full/
+results/bounded-conversions-precheck/
+```
+
+新脚本不会写入这些目录。专用 FP6/bounded 脚本的默认输出也已改为：
+
+```text
+results/fp6-strided-full/
+results/fp6-strided-precheck/
+results/bounded-conversions-strided-full/
+results/bounded-conversions-strided-precheck/
+```
+
+因此修改 stride 后不会覆盖历史约 1.5 TiB 的 `.bin`。
+
+## 专用 FP6 独立参考检查
+
+需要单独验证 FP6 软件参考时运行：
+
+```bash
+python3 run_gb10_fp6_precheck.py
+python3 run_gb10_fp6_full.py --yes-large
+```
+
+新的 FP6 precheck 对 8 条具体 PTX 的全部 258 个 packed 输入做重复性检查，并使用独立 E2M3/E3M2 软件模型比较 4,128 个 lane。默认报告：
+
+```text
+results/fp6-strided-precheck/precheck-report.json
+results/fp6-strided-full/full-run-report.json
+```
+
+## 通用底层 runner
+
+列出全部 85 条矩阵定义：
+
+```bash
+python3 run_gb10_ptx_accuracy.py --list
+```
+
+筛选某条指令并查看计划：
+
+```bash
+python3 run_gb10_ptx_accuracy.py \
+  --tests 'mixed_fma*' \
+  --profile full \
+  --shard-count 16 \
+  --shard-index 0 \
+  --plan
+```
+
+`run_gb10_ptx_accuracy.py` 负责测试矩阵、CUDA 生成、编译、执行、二进制 header、manifest 和 reference-dir 比较。正常正式测试优先使用 `run_gb10_all_strided.py`，避免手工遗漏分片。
+
+## 结果语义
+
+没有 `--reference-dir` 时，结果属于：
+
+```text
+GB10 golden capture with structural validation
+```
+
+这证明输入范围、JIT 执行、二进制结构、分片完整性和重复性，但不能表述成与独立数值模型比较通过。FP6 专用 precheck 是当前具备独立软件数值参考的例外。
 
 ## 二进制格式
 
-每个结果文件由 256 字节 little-endian header 和连续 16 字节 records 组成。
+每个文件包含 256-byte little-endian header 和连续 16-byte records：
 
 ```text
-Record:
-  uint32 source_a
-  uint32 source_b
-  uint32 source_c
-  uint32 masked_result
+uint32 source_a
+uint32 source_b
+uint32 source_c
+uint32 masked_result
 ```
 
-Header 保存格式版本、具体指令名、result mask、完整 sweep 记录数以及当前分片的起点和记录数。脚本会验证文件大小与 header 一致，并输出一个小型 JSON manifest 便于索引 `.bin` 文件。
+文件大小：
 
-结果先写入 `.bin.partial`，仅在 header 和文件长度验证成功后原子替换最终 `.bin`。manifest 名包含测试族，避免不同指令选择在相同 shard 上互相覆盖；manifest 同时记录 A/B/C 的完整范围。
+```text
+256 + shard_records × 16 bytes
+```
 
-未提供 `--reference-dir` 时，GB10 本身是表格指定的 golden source，因此脚本执行的是 golden capture 与完整性检查，不会把同一条硬件指令的输出伪装成独立 reference。提供参考目录后，任何 bit mismatch 都会返回非零退出码并报告首个不一致字节。
+header 保存格式版本、具体指令名、result mask、完整 sweep 记录数、分片起点和分片记录数。输入范围和 stride 同时记录在 manifest 中。结果先写入 `.bin.partial`，校验成功后再原子替换为 `.bin`。
 
 ## CPU 合约测试
 
 ```bash
-python3 -m unittest -v test_run_gb10_ptx_accuracy.py test_run_gb10_fp6_precheck.py
+python3 -m unittest -v \
+  test_run_gb10_ptx_accuracy.py \
+  test_run_gb10_fp6_precheck.py
 ```
 
-测试固定检查表格展开数量、FP6x2 双 lane mask、ADD/FMA stride、scaled 输入、smoke 采样、分片无缝覆盖、manifest 防覆盖、全量容量估算，以及 FP6 实验前检查的边界集合和独立参考编码。
+合约测试会检查全部 85 条矩阵定义、全局 stride、endpoint 包含规则、CUDA 13.1/13.2 选择数量、ADD/FMA 多 sweep、容量估算、分片覆盖和 FP6 软件参考表。

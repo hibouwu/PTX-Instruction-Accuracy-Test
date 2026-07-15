@@ -29,17 +29,12 @@ PRECHECK_SPEC.loader.exec_module(precheck)
 
 
 class FP6PrecheckContractTests(unittest.TestCase):
-    def test_boundary_plan_is_bounded_and_unique(self) -> None:
-        patterns = precheck.UPPER_LANE_PATTERNS
-        self.assertEqual(len(patterns), 23)
-        self.assertEqual(len(set(patterns)), len(patterns))
-        for value in (0x0000, 0x8000, 0x7C00, 0x7F80, 0xFC00, 0xFF80):
-            self.assertIn(value, patterns)
-
+    def test_strided_reference_plan_is_bounded(self) -> None:
         tests = runner.select_tests([precheck.TEST_PATTERN])
+        self.assertEqual(precheck.SAMPLE_RECORDS, 258)
+        self.assertEqual(precheck.EXPECTED_REFERENCE_LANES, 4_128)
         total = precheck.projected_bytes(tests)
-        self.assertGreater(total, 190 * 1024**2)
-        self.assertLess(total, 210 * 1024**2)
+        self.assertEqual(total, 72_704)
 
     def test_software_reference_known_encodings(self) -> None:
         e2m3_f16 = precheck.expected_table("f16x2", "e2m3x2", False)

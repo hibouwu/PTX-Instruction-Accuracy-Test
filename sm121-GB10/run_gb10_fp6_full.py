@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline, resumable launcher for the complete 512 GiB GB10 FP6 sweep."""
+"""Offline, resumable launcher for the globally strided GB10 FP6 sweep."""
 
 from __future__ import annotations
 
@@ -20,13 +20,13 @@ import run_gb10_ptx_accuracy as runner
 
 ROOT = Path(__file__).resolve().parent
 SHARD_COUNT = 16
-DEFAULT_OUTPUT_DIR = ROOT / "results" / "fp6-full"
-DEFAULT_PRECHECK_REPORT = ROOT / "results" / "fp6-precheck" / "precheck-report.json"
+DEFAULT_OUTPUT_DIR = ROOT / "results" / "fp6-strided-full"
+DEFAULT_PRECHECK_REPORT = ROOT / "results" / "fp6-strided-precheck" / "precheck-report.json"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run or resume all 16 offline shards of the 512 GiB GB10 FP6 sweep."
+        description="Run or resume all 16 offline shards of the globally strided GB10 FP6 sweep."
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--precheck-report", type=Path, default=DEFAULT_PRECHECK_REPORT)
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yes-large",
         action="store_true",
-        help="confirm generation of up to approximately 512 GiB",
+        help="confirm generation of the complete globally strided golden data",
     )
     return parser.parse_args()
 
@@ -56,8 +56,9 @@ def shard_complete(
     tests: Sequence[runner.Test],
     shard_index: int,
 ) -> bool:
-    start, count = runner.shard_slice(2**32, shard_index, SHARD_COUNT)
     for test in tests:
+        total_records = test.sweeps[0].count
+        start, count = runner.shard_slice(total_records, shard_index, SHARD_COUNT)
         path = expected_path(output_dir, test, shard_index)
         if not path.is_file():
             return False
@@ -68,7 +69,7 @@ def shard_complete(
         if (
             header["test_name"] != test.name
             or header["result_mask"] != 0xFFFF
-            or header["total_records"] != 2**32
+            or header["total_records"] != total_records
             or header["shard_start"] != start
             or header["shard_records"] != count
         ):
@@ -109,7 +110,10 @@ def load_precheck_report(path: Path) -> tuple[dict[str, object], str]:
     if report.get("status") != "PASS":
         raise RuntimeError(f"precheck status is not PASS: {path}")
     reference = report.get("reference")
-    if not isinstance(reference, dict) or reference.get("lanes") != 24_117_248:
+    if (
+        not isinstance(reference, dict)
+        or reference.get("lanes") != precheck.EXPECTED_REFERENCE_LANES
+    ):
         raise RuntimeError(f"precheck reference coverage is incomplete: {path}")
     return report, hashlib.sha256(raw).hexdigest()
 
@@ -201,14 +205,17 @@ def main() -> None:
     output_dir = args.output_dir.resolve()
     complete = [index for index in shards if shard_complete(output_dir, tests, index)]
     pending = [index for index in shards if index not in complete]
-    bytes_per_shard = runner.projected_bytes(tests, "full", 0, SHARD_COUNT, None)
+    remaining_bytes = sum(
+        runner.projected_bytes(tests, "full", index, SHARD_COUNT, None)
+        for index in pending
+    )
 
     print(f"requested shards: {args.start_shard}..{args.end_shard}")
     print(f"complete shards: {complete or 'none'}")
     print(f"pending shards: {pending or 'none'}")
     print(
-        f"remaining output: {len(pending) * bytes_per_shard} bytes "
-        f"({len(pending) * bytes_per_shard / 1024**3:.1f} GiB)"
+        f"remaining output: {remaining_bytes} bytes "
+        f"({remaining_bytes / 1024**3:.6f} GiB)"
     )
     if args.plan:
         return
@@ -229,7 +236,7 @@ def main() -> None:
         raise RuntimeError(f"nvcc not found: {nvcc}")
     precheck.configure_compatibility(args.compat_dir.resolve())
     output_dir.mkdir(parents=True, exist_ok=True)
-    required = len(pending) * bytes_per_shard
+    required = remaining_bytes
     available = shutil.disk_usage(output_dir).free
     if required > available:
         raise RuntimeError(

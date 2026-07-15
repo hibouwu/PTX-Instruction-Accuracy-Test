@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Run every bounded check required before the 512 GiB GB10 FP6 sweep.
+"""Run every bounded check required before the globally strided GB10 FP6 sweep.
 
 This is the single operational entry point for the PTX 9.1 conversions
 
     cvt.rn.satfinite{.relu}.{e2m3x2/e3m2x2}.{f16x2/bf16x2}
 
-It compiles once, exercises driver JIT, captures smoke data, verifies a repeated
-65,536-record run bit-for-bit, sweeps all lower-lane encodings for selected
-upper-lane boundary values, and compares every output lane with an independent
-software model.
+It compiles once, exercises driver JIT, captures smoke data, verifies the full
+strided sweep twice bit-for-bit, and compares every captured output lane with
+an independent software model.
 """
 
 from __future__ import annotations
@@ -30,47 +29,17 @@ import run_gb10_ptx_accuracy as runner
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_OUTPUT_DIR = ROOT / "results" / "fp6-precheck"
+DEFAULT_OUTPUT_DIR = ROOT / "results" / "fp6-strided-precheck"
 TEST_PATTERN = "fp16x2_to_f6x2*"
 ARCH = "compute_120f"
-SHARD_COUNT = 65_536
-SAMPLE_RECORDS = 65_536
+SAMPLE_RECORDS = runner.U32.count
+EXPECTED_REFERENCE_LANES = 8 * SAMPLE_RECORDS * 2
 RECORD = struct.Struct("<IIII")
-
-# Union of significant binary16 and bfloat16 encodings: signed zero,
-# subnormal/normal boundaries, +/-1, maximum finite values, infinities, and
-# signaling/quiet NaNs.  With 65,536 shards, the shard index is exactly the
-# upper 16-bit lane and every shard exhaustively enumerates the lower lane.
-UPPER_LANE_PATTERNS = (
-    0x0000,
-    0x0001,
-    0x007F,
-    0x0080,
-    0x03FF,
-    0x0400,
-    0x3C00,
-    0x3F80,
-    0x7BFF,
-    0x7C00,
-    0x7D00,
-    0x7E00,
-    0x7F7F,
-    0x7F80,
-    0x7F81,
-    0x7FC0,
-    0x8000,
-    0xBC00,
-    0xBF80,
-    0xFBFF,
-    0xFC00,
-    0xFF7F,
-    0xFF80,
-)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the complete bounded precheck before the 512 GiB GB10 FP6 sweep."
+        description="Run the complete precheck before the globally strided GB10 FP6 sweep."
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--nvcc", default="/usr/local/cuda/bin/nvcc")
@@ -84,19 +53,15 @@ def parse_args() -> argparse.Namespace:
 def projected_bytes(tests: Sequence[runner.Test]) -> int:
     smoke = runner.projected_bytes(tests, "smoke", 0, 1, None)
     determinism = 2 * runner.projected_bytes(tests, "full", 0, 1, SAMPLE_RECORDS)
-    adversarial = len(UPPER_LANE_PATTERNS) * runner.projected_bytes(
-        tests, "full", 0, SHARD_COUNT, None
-    )
-    return smoke + determinism + adversarial
+    return smoke + determinism
 
 
 def print_plan(tests: Sequence[runner.Test], output_dir: Path) -> None:
     total = projected_bytes(tests)
     print(f"tests: {len(tests)}")
-    print("stages: compile/JIT preflight, smoke, deterministic repeat, adversarial reference")
+    print("stages: compile/JIT preflight, smoke, full deterministic repeat, software reference")
     print(f"deterministic records per test: {SAMPLE_RECORDS}")
-    print(f"adversarial upper-lane patterns: {len(UPPER_LANE_PATTERNS)}")
-    print(f"adversarial lower-lane values per pattern: {SHARD_COUNT}")
+    print(f"independent-reference lanes: {EXPECTED_REFERENCE_LANES}")
     print(f"projected binary bytes: {total} ({total / 1024**2:.1f} MiB)")
     print(f"output: {output_dir.resolve()}")
 
@@ -233,21 +198,19 @@ def expected_table(source: str, dtype: str, relu: bool) -> tuple[int, ...]:
     return tuple(outputs)
 
 
-def validate_adversarial(output_dir: Path) -> dict[str, int]:
-    expected_files = len(UPPER_LANE_PATTERNS) * 8
+def validate_reference(output_dir: Path) -> dict[str, int]:
     paths = sorted(output_dir.glob("fp16x2_to_f6x2__*/*.bin"))
-    if len(paths) != expected_files:
-        raise RuntimeError(f"expected {expected_files} adversarial binaries, found {len(paths)}")
+    if len(paths) != 8:
+        raise RuntimeError(f"expected 8 FP6 reference binaries, found {len(paths)}")
     partials = list(output_dir.rglob("*.partial"))
     if partials:
-        raise RuntimeError(f"found {len(partials)} incomplete adversarial outputs")
+        raise RuntimeError(f"found {len(partials)} incomplete reference outputs")
 
     records = 0
     lanes = 0
     nan_lanes = 0
     negative_lanes = 0
     padding_checks = 0
-    seen_shards: set[int] = set()
 
     for path in paths:
         name = path.parent.name
@@ -256,23 +219,27 @@ def validate_adversarial(output_dir: Path) -> dict[str, int]:
         relu = name.endswith("__relu")
         table = expected_table(source, dtype, relu)
         with path.open("rb") as stream:
-            raw_header = stream.read(runner.HEADER_SIZE)
-            header = runner.HEADER_STRUCT.unpack(raw_header)
-            if header[:4] != (runner.MAGIC, runner.FORMAT_VERSION, runner.HEADER_SIZE, runner.RECORD_SIZE):
-                raise RuntimeError(f"invalid binary header: {path}")
-            if header[5] != 0xFFFF or header[6] != 2**32 or header[8] != SHARD_COUNT:
-                raise RuntimeError(f"unexpected FP6 range metadata: {path}")
-            shard_start = header[7]
-            shard_index = shard_start // SHARD_COUNT
-            seen_shards.add(shard_index)
-            for index in range(header[8]):
+            header = runner.read_header(path)
+            if (
+                header["result_mask"] != 0xFFFF
+                or header["total_records"] != SAMPLE_RECORDS
+                or header["shard_start"] != 0
+                or header["shard_records"] != SAMPLE_RECORDS
+            ):
+                raise RuntimeError(f"unexpected FP6 strided range metadata: {path}")
+            stream.seek(runner.HEADER_SIZE)
+            for index in range(SAMPLE_RECORDS):
                 raw = stream.read(RECORD.size)
                 if len(raw) != RECORD.size:
                     raise RuntimeError(f"truncated record {index}: {path}")
                 source_a, source_b, source_c, result = RECORD.unpack(raw)
+                expected_source = min(
+                    runner.U32.maximum,
+                    runner.U32.start + index * runner.U32.stride,
+                )
                 if source_a != 0 or source_c != 0xDEADBEEF:
                     raise RuntimeError(f"fixed input mismatch at record {index}: {path}")
-                if source_b != shard_start + index:
+                if source_b != expected_source:
                     raise RuntimeError(f"enumeration mismatch at record {index}: {path}")
                 if result & 0xC0C0:
                     raise RuntimeError(f"nonzero FP6 padding bits at record {index}: {path}")
@@ -295,9 +262,10 @@ def validate_adversarial(output_dir: Path) -> dict[str, int]:
             if stream.read(1):
                 raise RuntimeError(f"trailing binary data: {path}")
 
-    if seen_shards != set(UPPER_LANE_PATTERNS):
-        missing = sorted(set(UPPER_LANE_PATTERNS) - seen_shards)
-        raise RuntimeError(f"adversarial shard coverage mismatch; missing={missing}")
+    if lanes != EXPECTED_REFERENCE_LANES:
+        raise RuntimeError(
+            f"reference lane coverage mismatch: expected {EXPECTED_REFERENCE_LANES}, got {lanes}"
+        )
     return {
         "files": len(paths),
         "records": records,
@@ -339,7 +307,7 @@ def main() -> None:
     smoke_dir = output_dir / "smoke"
     run_capture(binary, tests, smoke_dir, profile="smoke", chunk_records=args.chunk_records)
 
-    runner.log("=== deterministic 65,536-record capture ===")
+    runner.log(f"=== deterministic full {SAMPLE_RECORDS}-record capture ===")
     baseline_dir = output_dir / "determinism" / "baseline"
     repeat_dir = output_dir / "determinism" / "repeat"
     run_capture(
@@ -360,25 +328,8 @@ def main() -> None:
         chunk_records=args.chunk_records,
     )
 
-    runner.log("=== exhaustive lower lane + adversarial upper lane ===")
-    adversarial_dir = output_dir / "adversarial"
-    for position, shard_index in enumerate(UPPER_LANE_PATTERNS, 1):
-        runner.log(
-            f"adversarial shard {position}/{len(UPPER_LANE_PATTERNS)}: "
-            f"upper_lane=0x{shard_index:04x}"
-        )
-        run_capture(
-            binary,
-            tests,
-            adversarial_dir,
-            profile="full",
-            shard_index=shard_index,
-            shard_count=SHARD_COUNT,
-            chunk_records=args.chunk_records,
-        )
-
     runner.log("=== independent FP6 software reference ===")
-    reference_stats = validate_adversarial(adversarial_dir)
+    reference_stats = validate_reference(baseline_dir)
     elapsed = time.time() - started
     report = {
         "status": "PASS",
@@ -387,7 +338,6 @@ def main() -> None:
         "compat_dir": str(args.compat_dir.resolve()),
         "host": platform.node(),
         "test_count": len(tests),
-        "upper_lane_patterns": [f"0x{value:04x}" for value in UPPER_LANE_PATTERNS],
         "determinism_records_per_test": SAMPLE_RECORDS,
         "reference": reference_stats,
         "binary_bytes": sum(path.stat().st_size for path in output_dir.rglob("*.bin")),
@@ -396,7 +346,7 @@ def main() -> None:
     report_path = output_dir / "precheck-report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     runner.log(
-        f"PRECHECK PASS: {reference_stats['files']} adversarial binaries, "
+        f"PRECHECK PASS: {reference_stats['files']} strided reference binaries, "
         f"{reference_stats['lanes']} lanes matched the independent reference"
     )
     runner.log(f"report: {report_path}")

@@ -93,16 +93,18 @@ class Test:
     min_cuda: tuple[int, int] = (13, 0)
 
 
-U32 = ValueRange(0, 0xFFFFFFFF, 1)
-U32_SPARSE = ValueRange(0, 0xFFFFFFFF, 0x00FFFFFF)
-U16 = ValueRange(0, 0xFFFF, 1)
-U16_SPARSE_FF = ValueRange(0, 0xFFFF, 0xFF)
+# Test-spec global strides.  The endpoint is still included by ValueRange,
+# even when the stride does not land on it naturally.
+U32 = ValueRange(0, 0xFFFFFFFF, 0x00FFFFFF)
+U32_SPARSE = U32
+U16 = ValueRange(0, 0xFFFF, 0xFF)
+U16_SPARSE_FF = U16
 FIXED_ZERO = ValueRange(0, 0, 0)
 FIXED_DEADBEEF = ValueRange(0xDEADBEEF, 0xDEADBEEF, 0)
-SCALE_C = ValueRange(0, 0xFFFF0000, 0x00010000)
+SCALE_C = ValueRange(0, 0xFFFF0000, 0x00FF0000)
 
-F32_PAIR = Sweep("f32-pair", U32, U32_SPARSE, FIXED_DEADBEEF)
-F32_PAIR_SCALED = Sweep("f32-pair-scale", U32, U32_SPARSE, SCALE_C)
+F32_PAIR = Sweep("f32-pair", U32, U32, FIXED_DEADBEEF)
+F32_PAIR_SCALED = Sweep("f32-pair-scale", U32, U32, SCALE_C)
 PACKED_B32 = Sweep("packed-b32", FIXED_ZERO, U32, FIXED_DEADBEEF)
 PACKED_B32_SCALED = Sweep("packed-b32-scale", FIXED_ZERO, U32, SCALE_C)
 PACKED_B32_FIXED_SCALE = Sweep("packed-b32-fixed-scale", FIXED_ZERO, U32, FIXED_DEADBEEF)
@@ -111,7 +113,7 @@ PACKED_B16_SCALED = Sweep("packed-b16-scale", FIXED_ZERO, U16, SCALE_C)
 
 ADD_SWEEPS = (
     Sweep("a-sparse-c-full", U16_SPARSE_FF, FIXED_ZERO, U32),
-    Sweep("a-full-c-sparse", U16, FIXED_ZERO, ValueRange(0, 0xFFFFFFFF, 0xFFFF)),
+    Sweep("a-full-c-sparse", U16, FIXED_ZERO, U32),
 )
 
 FMA_SWEEPS = (
@@ -120,13 +122,13 @@ FMA_SWEEPS = (
         "a-sparse-b-full-c-sparse-ffffff",
         U16_SPARSE_FF,
         U16,
-        ValueRange(0, 0xFFFFFFFF, 0x00FFFFFF),
+        U32,
     ),
     Sweep(
         "a-full-b-sparse-c-sparse-ffff",
         U16,
         U16_SPARSE_FF,
-        ValueRange(0, 0xFFFFFFFF, 0x0000FFFF),
+        U32,
     ),
 )
 
