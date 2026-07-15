@@ -248,6 +248,76 @@ python3 run_gb10_ptx_accuracy.py \
 
 参考目录需要使用相同的 `<test-name>/<sweep-name>__shard-...bin` 层级。根目录下的 manifest 使用相对路径索引各指令子目录中的二进制文件。
 
+## FP4、UE8M0 与其他有限空间转换全量测试
+
+`run_gb10_bounded_conversions.py` 是以下 20 条 CUDA 13.1 可用转换指令的唯一操作入口：
+
+```text
+fp16x2_to_f4x2*                 4 条，每条 2^32 个输入
+bf16x2_to_ue8m0x2*             4 条，每条 2^32 个输入
+bf16x2_to_s2f6x2*              4 条，每条 2^32 个输入
+s2f6x2_to_bf16x2_scaled*       4 条，每条 2^32 个输入
+f6x2_to_f16x2*                 2 条，每条 2^16 个输入
+f4x2_to_f16x2*                 1 条，每条 2^16 个输入
+ue8m0x2_to_bf16x2*             1 条，每条 2^16 个输入
+```
+
+完整结果约 1,024.004 GiB，固定划分为 16 个分片；每个分片约 64 GiB，共生成 320 个 `.bin`。先执行统一 precheck：
+
+该批次固定使用 `compute_121a` 生成 application-specific PTX，因为 `.s2f6x2` 在 GB10 上属于 SM121 application-specific 特性；`compute_120f` 或 `compute_121f` 会被 PTX 汇编器正确拒绝。
+
+```bash
+cd /home/xp6/PTX-Instruction-Accuracy-Test/sm121-GB10
+python3 run_gb10_bounded_conversions.py precheck
+```
+
+该步骤自动加载 CUDA 13.1 compatibility JIT、生成并编译一次 CUDA runner、对 20 条具体 PTX 执行 preflight，并重复捕获 smoke 数据进行逐字节确定性比较。已有 precheck 默认不会被覆盖；确需重跑时使用：
+
+```bash
+python3 run_gb10_bounded_conversions.py precheck --overwrite-precheck
+```
+
+查看完整计划、已有分片和剩余容量：
+
+```bash
+python3 run_gb10_bounded_conversions.py plan
+```
+
+precheck 为 `PASS` 后，一条命令离线运行或续跑全部分片：
+
+```bash
+python3 run_gb10_bounded_conversions.py full --yes-large
+```
+
+中断后执行同一命令即可跳过完整分片并继续。也可只跑指定分片，例如 shard 3：
+
+```bash
+python3 run_gb10_bounded_conversions.py full \
+  --start-shard 3 \
+  --end-shard 3 \
+  --yes-large
+```
+
+全部数据已经存在时，可只验证 320 个二进制、16 个 manifest、0 个 `.partial`，并重新生成最终 JSON 报告：
+
+```bash
+python3 run_gb10_bounded_conversions.py report
+```
+
+默认输出：
+
+```text
+results/bounded-conversions-precheck/
+└── precheck-report.json
+
+results/bounded-conversions-full/
+├── full-run-report.json
+├── manifest-*.json
+└── <test-name>/*.bin
+```
+
+这组 precheck 验证 PTX 编译/JIT、二进制结构和同一硬件重复运行的一致性。没有提供独立数值参考模型，因此最终报告明确标记为 GB10 golden capture，不能表述为独立 reference 精度比较通过。
+
 涉及 `.s2f6x2` 以及 FP16/BF16 到 FP4/FP6 的 PTX 9.1 指令需要 CUDA 13.1 或更高版本。`bf16x2 <- f6x2/f4x2` 属于 PTX ISA 9.2，需要 CUDA 13.2 或更高版本。脚本会在编译前检查 `nvcc` 版本。
 
 ## 二进制格式

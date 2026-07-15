@@ -19,6 +19,8 @@ runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
 
+import run_gb10_bounded_conversions as bounded
+
 
 def values(value_range: object) -> tuple[int, ...]:
     return tuple(
@@ -96,6 +98,22 @@ class RunnerContractTests(unittest.TestCase):
         self.assertEqual(shard, 8 * (runner.HEADER_SIZE + 2**28 * runner.RECORD_SIZE))
         with redirect_stdout(io.StringIO()):
             runner.print_plan(tests, Path("/tmp/results"), "full", 0, 16, None)
+
+    def test_bounded_conversion_selection_is_cuda_13_1_and_one_tib(self) -> None:
+        tests = bounded.selected_tests()
+        self.assertEqual(bounded.ARCH, "compute_121a")
+        self.assertEqual(len(tests), 20)
+        self.assertEqual(sum(test.sweeps[0].count == 2**32 for test in tests), 16)
+        self.assertEqual(sum(test.sweeps[0].count == 2**16 for test in tests), 4)
+        self.assertTrue(all(test.min_cuda <= (13, 1) for test in tests))
+        self.assertEqual(
+            runner.projected_bytes(tests, "full", 0, 1, None),
+            1_099_515_827_200,
+        )
+        self.assertAlmostEqual(
+            runner.projected_bytes(tests, "full", 0, 16, None) / 1024**3,
+            64.00024890899658,
+        )
 
 
 if __name__ == "__main__":
