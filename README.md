@@ -1,9 +1,32 @@
 # README
 
-![alt text](image.png)
-![alt text](image-1.png)
-![alt text](image-2.png)
+## FP32 Arithmetic Instructions
 
+| PTX | Golden source | Comments | States |
+|---|---|---|---|
+| `add{.rnd}{.sat}.f32.atype d, a, c;` | GB10 | Test 1:<br>Source A range: `0x0~0xFFFF`; stride = `0xFF`<br>Source C range: `0x0~0xFFFFFFFF`<br><br>Test 2:<br>Source A range: `0x0~0xFFFF`<br>Source C range: `0x0~0xFFFFFFFF`; stride = `0xFFFF` | |
+| `fma.rnd{.sat}.f32.abtype d, a, b, c;` | GB10 | Test 1:<br>Source A range: `0x0~0xFFFF`; stride = `0xFF`<br>Source B range: `0x0~0xFFFF`; stride = `0xFF`<br>Source C range: `0x0~0xFFFFFFFF`<br><br>Test 2:<br>Source A range: `0x0~0xFFFF`; stride = `0xFF`<br>Source B range: `0x0~0xFFFF`<br>Source C range: `0x0~0xFFFFFFFF`; stride = `0xFFFFFF`<br><br>Test 3:<br>Source A range: `0x0~0xFFFF`<br>Source B range: `0x0~0xFFFF`; stride = `0xFF`<br>Source C range: `0x0~0xFFFFFFFF`; stride = `0xFFFF` | |
+
+## Conversion Instructions
+
+| PTX | Golden source | Comments | States |
+|---|---|---|---|
+| `cvt.rn.satfinite{.relu}.f6x2type.fp16x2type d, a;` | GB10 | Source B range: `0~0xFFFFFFFF` | |
+| `cvt.rn.satfinite{.relu}.f4x2type.fp16x2type d, a;` | GB10 | Source B range: `0~0xFFFFFFFF`<br>Source C: `0xdeadbeef`<br>Only compare lower 8 bits of result | |
+| `cvt.frnd3{.satfinite}.ue8m0x2.bf16x2 d, a;` | GB10 | Source B range: `0~0xFFFFFFFF`<br>Source C: `0xdeadbeef`<br>Only compare lower 16 bits of result | |
+| `cvt.rn.satfinite{.relu}{.scaled::n2::ue8m0}.s2f6x2.bf16x2 d, a{, scale-factor};` | GB10 | Source B range: `0~0xFFFFFFFF`<br>Source C: `0xdeadbeef`<br>Only compare lower 16 bits of result | |
+| `cvt.rn.f16x2.f6x2type d, a;` | GB10 | Source B range: `0~0xFFFF` | |
+| `cvt.rn.f16x2.f4x2type d, a;` | GB10 | Source B range: `0~0xFFFF` | |
+| `cvt.rn{.relu}{.satfinite}.scaled::n2::ue8m0.bf16x2.f8x2type d, a, scale-factor;` | Ref model |  | |
+| `cvt.rn{.relu}{.satfinite}.scaled::n2::ue8m0.bf16x2.f6x2type d, a, scale-factor;` | GB10 | Source B range: `0~0xFFFF`<br>Scale-factor range: `0~0xFFFF` | |
+| `cvt.rn{.satfinite}{.relu}.scaled::n2::ue8m0.bf16x2.s2f6x2 d, a, scale-factor;` | GB10 | Source B range: `0~0xFFFF`<br>Scale-factor range: `0~0xFFFF` | |
+| `cvt.rn.bf16x2.ue8m0x2 d, a;` | GB10 | Source B range: `0~0xFFFF` | |
+| `cvt.rn{.relu}{.satfinite}.scaled::n2::ue8m0.bf16x2.f4x2type d, a, scale-factor;` | GB10 | Source B range: `0~0xFFFF`<br>Scale-factor range: `0~0xFFFF` | |
+| `cvt.rn.satfinite.f6x2type.f32 d, a, b;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C: `0xdeadbeef`<br>Only compare lower 16 bits of result | |
+| `cvt.rn.satfinite.f4x2type.f32 d, a, b;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C: `0xdeadbeef`<br>Only compare lower 16 bits of result | |
+| `cvt.{.rz,.rp}{.satfinite}.ue8m0x2.f32 d, a, b;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C: `0xdeadbeef`<br>Only compare lower 16 bits of result | |
+| `cvt.rn.satfinite{.relu}.scaled::n2::ue8m0.s2f6x2.f32 d, a, b, scale-factor;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C: `bit[31:16]`, range `0~0xFFFF`<br>Only compare lower 16 bits of result | |
+| `cvt.rs.satfinite.bf16x2.f32 d, a, b, rbits;` | GB10 | Source A range: `0~0xFFFFFFFF`<br>Source B range: `0~0xFFFFFFFF`; stride = `0xFFFFFF`<br>Source C (`Rbits`): lower 16 bits = higher 16 bits; range `0~0xFFFF` | |
 ```bash
 cd /home/jianyeshi/Note/PTX-Instruction-Accuracy-Test/sm121-GB10
 
