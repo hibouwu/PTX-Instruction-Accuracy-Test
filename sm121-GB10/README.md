@@ -9,6 +9,78 @@
 
 `ValueRange` 会在 stride 未自然落到最大值时额外包含终点，因此两种范围都包含 258 个值。存放在 `source_c[31:16]` 的 scale-factor 使用物理 stride `0x00FF0000`，对应逻辑 16-bit scale stride `0xFF`。
 
+## PTX 9.2 的 12 条 scaled FP4/FP6 → BF16x2 指令
+
+`run_gb10_ptx92_scaled.py` 是这一指令族唯一的用户入口。它包含以下全部工作，不需要再组合独立 checker 或辅助脚本：
+
+1. 固定选择 8 条 F6（E2M3/E3M2）和 4 条 F4（E2M1）具体 PTX；
+2. 生成包含 12 条 inline PTX 的 CUDA runner；
+3. 使用 CUDA 13.2 编译为 `compute_120f`，加载 13.2 compatibility JIT，并逐条 preflight；
+4. 对合法输入运行 baseline 与 repeat，逐字节确认确定性；
+5. 用不依赖 GPU 输出的整数/指数 BF16 模型逐 lane 比较；
+6. 按 README Comments 范围运行 16 个可续跑分片；
+7. 校验 header、输入枚举、文件集合、manifest 和 SHA256；
+8. 生成 JSON 与 Markdown 正式报告。
+
+推荐在 GB10 本机一次离线跑完：
+
+```bash
+cd /home/xp6/PTX-Instruction-Accuracy-Test/sm121-GB10
+python3 run_gb10_ptx92_scaled.py all
+```
+
+常用分阶段命令：
+
+```bash
+# 只做 CPU 参考模型和 12 条矩阵合约自检
+python3 run_gb10_ptx92_scaled.py selftest
+
+# 查看记录数、输出容量和待运行分片
+python3 run_gb10_ptx92_scaled.py plan
+
+# 正式实验前检查：生成/编译/JIT、baseline+repeat、独立数值参考
+python3 run_gb10_ptx92_scaled.py precheck
+
+# 运行或续跑 Comments 全量 capture；完成后自动生成报告
+python3 run_gb10_ptx92_scaled.py full
+
+# 不执行 GPU，仅重新核验完整结果并生成报告
+python3 run_gb10_ptx92_scaled.py report
+```
+
+中断后重新执行 `full` 或 `all` 会校验并跳过已经完成的分片。只有确实要删除并重跑已有实验前结果时才使用：
+
+```bash
+python3 run_gb10_ptx92_scaled.py all --overwrite-precheck
+```
+
+默认环境和输出：
+
+```text
+nvcc:       /usr/local/cuda-13.2/bin/nvcc
+compat JIT: /usr/local/cuda-13.2/compat
+target:     compute_120f
+
+results/ptx92-scaled-precheck/
+├── baseline/
+├── repeat/
+└── precheck-report.json
+
+results/ptx92-scaled-full/
+├── <test-name>/<sweep>__shard-*.bin
+├── manifest-*.json
+├── full-run-report.json
+└── full-run-report.md
+```
+
+规模：每条 Comments capture 为 `258 × 258 = 66,564` records，12 条共约 12.235 MiB；合法域 baseline+repeat 共 516 × 2 个 `.bin`、约 266.314 MiB，比较 17,436,672 个 result lane。
+
+### 正确性结论边界
+
+E2M3/E3M2 的 packed `.b16` source 每个 byte 只有低 6 bit 是数值，高 2 bit 是 padding 且必须为零。README Comments 的 raw `0x0000~0xffff, stride 0xff` 会产生非零 padding：这些输出仍保存在 full 目录作为 GB10 golden observation，但不能称为 PTX 定义的数值结果。
+
+独立 precheck 因此单独枚举全部合法 source：每个 F6 变体覆盖 `64 × 64` 个 packed pair，每个 F4 变体覆盖全部 `256` 个 packed byte；scale lattice 让两条 lane 都分别覆盖全部 256 个 UE8M0 code。最终报告把 Comments capture 完整性与合法定义域数值 `PASS` 分开记录，避免把保留位输入误报成精度通过。
+
 ## 推荐入口：全部 strided 测试
 
 `run_gb10_all_strided.py` 是正式运行入口，自动完成：
