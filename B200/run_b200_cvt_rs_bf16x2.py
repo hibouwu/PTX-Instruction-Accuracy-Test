@@ -35,7 +35,7 @@ TOTAL_RECORDS = A_END - A_BEGIN + 1
 HEADER_SIZE = 256
 RECORD_SIZE = 4
 MAGIC = b"B2RS2\0\0\0"
-HEADER = struct.Struct("<8sIIIIQQIIII128s68s")
+HEADER = struct.Struct("<8sIIIIQQIIII128s72s")
 RESULT = struct.Struct("<I")
 
 TESTS = (
@@ -96,7 +96,7 @@ struct Header {
   std::uint32_t fixed_b;
   std::uint32_t fixed_rbits;
   char test_name[128];
-  char reserved[68];
+  char reserved[72];
 };
 #pragma pack(pop)
 
@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
 
 def args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="B200 FP16x2/BF16x2 .rs stride-1 test")
-    parser.add_argument("command", choices=("selftest", "plan", "run", "report"))
+    parser.add_argument("command", choices=("selftest", "plan", "precheck", "run", "report"))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--nvcc", default=DEFAULT_NVCC)
     parser.add_argument("--chunk-records", type=int, default=1_048_576)
@@ -348,6 +348,7 @@ def check_d(test: dict[str, object], a: int, d: int, context: str) -> tuple[int,
 
 
 def selftest() -> None:
+    assert HEADER.size == HEADER_SIZE
     assert TOTAL_RECORDS == 25_165_825
     assert (FIXED_RBITS & 0xE000E000) == 0
     assert ref_f16(0x33800000, 0) == ("exact", 1)
@@ -511,6 +512,13 @@ def full_run(options: argparse.Namespace) -> None:
     print(f"report: {path}")
 
 
+def precheck_only(options: argparse.Namespace) -> None:
+    output = options.output_dir.resolve()
+    binary, provenance = build(options.nvcc)
+    path = precheck(binary, output, provenance)
+    print(f"PRECHECK PASS: {path}")
+
+
 def main() -> None:
     options = args()
     selftest()
@@ -520,6 +528,8 @@ def main() -> None:
         print("SELFTEST PASS: ranges, Rbits layouts, FP16/BF16 references")
     elif options.command == "plan":
         plan(options.output_dir.resolve())
+    elif options.command == "precheck":
+        precheck_only(options)
     elif options.command == "run":
         full_run(options)
     else:
