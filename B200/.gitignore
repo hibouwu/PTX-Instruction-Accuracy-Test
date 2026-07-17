@@ -1,0 +1,5 @@
+build/
+generated/
+results/
+__pycache__/
+
