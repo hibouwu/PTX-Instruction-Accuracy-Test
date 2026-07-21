@@ -34,7 +34,7 @@ class FP6PrecheckContractTests(unittest.TestCase):
         self.assertEqual(precheck.SAMPLE_RECORDS, 258)
         self.assertEqual(precheck.EXPECTED_REFERENCE_LANES, 4_128)
         total = precheck.projected_bytes(tests)
-        self.assertEqual(total, 72_704)
+        self.assertEqual(total, 66_560)
 
     def test_software_reference_known_encodings(self) -> None:
         e2m3_f16 = precheck.expected_table("f16x2", "e2m3x2", False)

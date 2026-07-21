@@ -219,14 +219,9 @@ def validate_reference(output_dir: Path) -> dict[str, int]:
         relu = name.endswith("__relu")
         table = expected_table(source, dtype, relu)
         with path.open("rb") as stream:
-            header = runner.read_header(path)
-            if (
-                header["result_mask"] != 0xFFFF
-                or header["total_records"] != SAMPLE_RECORDS
-                or header["shard_start"] != 0
-                or header["shard_records"] != SAMPLE_RECORDS
-            ):
-                raise RuntimeError(f"unexpected FP6 strided range metadata: {path}")
+            layout = runner.read_payload_layout(path)
+            if layout["shard_records"] != SAMPLE_RECORDS:
+                raise RuntimeError(f"unexpected FP6 payload size: {path}")
             stream.seek(runner.HEADER_SIZE)
             for index in range(SAMPLE_RECORDS):
                 raw = stream.read(RECORD.size)

@@ -1,3 +1,75 @@
+# cvt指令精度测试
+
+# 临时指令单测
+
+## 连接远程 B200
+
+![alt text](image-1.png)
+
+按图示进入容器：
+
+```Plain Text
+ssh g7ruf9ltvagnl4-64411eef@ssh.runpod.io -i ~/.ssh/id_ed25519
+```
+
+## 直接输入指令
+
+```Plain Text
+cat >/tmp/cvt.cu <<'EOF'
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdint>
+__global__ void k(uint32_t *out) {
+  float a = __uint_as_float(0x338003ff);
+  float b = __uint_as_float(0x33800400);
+  uint32_t d;
+  asm volatile("cvt.rs.satfinite.f16x2.f32 %0,%1,%2,%3;"
+               : "=r"(d) : "f"(a), "f"(b), "r"(0x1fff1fff));
+  *out = d;
+}
+int main() {
+  uint32_t *d, h;
+  cudaMalloc(&d, 4);
+  k<<<1,1>>>(d);
+  cudaMemcpy(&h, d, 4, cudaMemcpyDeviceToHost);
+  printf("d=%08x low=%04x high=%04x\n", h, h & 0xffff, h >> 16);
+  cudaFree(d);
+}
+EOF
+CUDA=/usr/local/cuda-12.8
+$CUDA/bin/nvcc -O3 -arch=sm_100a /tmp/cvt.cu -o /tmp/cvt &&
+/tmp/cvt &&
+$CUDA/bin/cuobjdump --dump-sass /tmp/cvt | grep -E 'F2FP.*RS'
+```
+
+输出如下：
+
+```Plain Text
+d=00010002 low=0002 high=0001
+        /*0050*/                   F2FP.SATFINITE.F16.F32.PACK_AB.RS R4, R4, 5.9611920733004808426e-08, R5 ;  /* 0x338004000404783e */
+```
+
+## 测试历史：
+
+|cvt\.rs\.relu\.satfinite\.f16x2\.f32        d, a, b, rbits;    a = 0, b=1, rbits=0x1fff|0x00003c00|
+|---|---|
+|a = 0x8761fff, b = 0x21002, rbits = 0xffe|0x00000000|
+|a = 0x38761fff, b = 0x21002, rbits = 0xffe|0x03d80000|
+|a = 0x38762001, b = 0xdeadbeef, rbits = 0||
+|cvt\.rn\.satfinite\.relu\.tf32\.f32      d, a;    a\_value = 0x7f7ff000|0x7f7fe000|
+|cvt\.rn\.relu\.satfinite\.f16\.f32       d, a;   // a= 0x33800400|0x0001|
+|cvt\.rn\.relu\.satfinite\.f16x2\.f32     d, a, b;   // a, b =0x33800400|0x00010001|
+|cvt\.rs\.satfinite\.f16x2\.f32        d, a, b, rbits;   // a = 0x33c00001, b=0x33c00000, rbits = 0x1fff<br>实际测试使用的 rbits = 0x00001FFF|0x00010002<br>|
+|a = 0x33c00001, b=0x33c00000, rbits = 0x1fff1fff|0x00020002|
+|a = 0x338003ff, b=0x33800400, rbits = 0x1fff1fff|0x00010002|
+
+
+
+# 批量测试脚本
+
+## 写入一个python文件
+
+```Python
 #!/usr/bin/env python3
 """B200 stride-1 test for FP16x2/BF16x2 stochastic conversion.
 
@@ -18,7 +90,6 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Sequence
-
 
 ROOT = Path(__file__).resolve().parent
 GENERATED = ROOT / "generated" / "b200_cvt_rs_f16_bf16_generated.cu"
@@ -53,7 +124,6 @@ TESTS = (
     },
 )
 
-
 CUDA_SOURCE = r'''#include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdint>
@@ -65,12 +135,12 @@ CUDA_SOURCE = r'''#include <cuda_runtime.h>
 #include <vector>
 
 #define CUDA_CHECK(call) do {                                                \
-  cudaError_t s_ = (call);                                                   \
-  if (s_ != cudaSuccess) {                                                   \
-    std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__,                 \
-                 cudaGetErrorString(s_));                                    \
-    std::exit(1);                                                            \
-  }                                                                          \
+  cudaError_t s_ = (call);                                                   **\**
+  if (s_ != cudaSuccess) {                                                   **\**
+    std::fprintf(stderr, "%s:%d: %s**\n**", __FILE__, __LINE__,                 **\**
+                 cudaGetErrorString(s_));                                    **\**
+    std::exit(1);                                                            **\**
+  }                                                                          **\**
 } while (0)
 
 static constexpr std::uint32_t kABegin = 0x33000000u;
@@ -122,7 +192,7 @@ __global__ void convert_bf16(std::uint64_t count, Input const* inputs,
 std::uint64_t parse(char const* text) {
   char* end = nullptr;
   unsigned long long value = std::strtoull(text, &end, 0);
-  if (end == text || *end != '\0') std::exit(2);
+  if (end == text || *end != '**\0**') std::exit(2);
   return static_cast<std::uint64_t>(value);
 }
 
@@ -130,7 +200,7 @@ void check_device() {
   cudaDeviceProp p{};
   CUDA_CHECK(cudaGetDeviceProperties(&p, 0));
   if (p.major != 10 || p.minor != 0 || std::strstr(p.name, "B200") == nullptr) {
-    std::fprintf(stderr, "B200 required; detected %s sm_%d%d\n", p.name, p.major, p.minor);
+    std::fprintf(stderr, "B200 required; detected %s sm_%d%d**\n**", p.name, p.major, p.minor);
     std::exit(4);
   }
 }
@@ -206,7 +276,6 @@ int main(int argc, char** argv) {
 }
 '''
 
-
 def args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="B200 FP16x2/BF16x2 .rs stride-1 test")
     parser.add_argument("command", choices=("selftest", "plan", "precheck", "run", "report"))
@@ -214,7 +283,6 @@ def args() -> argparse.Namespace:
     parser.add_argument("--nvcc", default=DEFAULT_NVCC)
     parser.add_argument("--chunk-records", type=int, default=1_048_576)
     return parser.parse_args()
-
 
 def command(items: Sequence[object], *, echo: bool = True) -> str:
     argv = [str(item) for item in items]
@@ -227,7 +295,6 @@ def command(items: Sequence[object], *, echo: bool = True) -> str:
         raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(argv)}")
     return proc.stdout
 
-
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -235,11 +302,9 @@ def sha256(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 
-
 def nan16(bits: int, slug: str) -> bool:
     return ((bits & 0x7F80) == 0x7F80 and (bits & 0x7F) != 0) if slug == "bf16x2" \
         else ((bits & 0x7C00) == 0x7C00 and (bits & 0x3FF) != 0)
-
 
 def ref_bf16(source: int, random16: int) -> tuple[str, int | None]:
     magnitude = source & 0x7FFFFFFF
@@ -253,7 +318,6 @@ def ref_bf16(source: int, random16: int) -> tuple[str, int | None]:
     if (result & 0x7FFF) >= 0x7F80:
         result = sign | 0x7F7F
     return "exact", result
-
 
 def ref_f16(source: int, random13: int) -> tuple[str, int | None]:
     magnitude = source & 0x7FFFFFFF
@@ -279,14 +343,12 @@ def ref_f16(source: int, random13: int) -> tuple[str, int | None]:
     result = base + ((discarded + (random13 & 0x1FFF)) >> 13)
     return "exact", sign | min(result, 0x7BFF)
 
-
 def expected(test: dict[str, object], a: int) -> tuple[tuple[str, int | None], tuple[str, int | None]]:
     if test["slug"] == "f16x2":
         fn, random = ref_f16, FIXED_RBITS & 0x1FFF
     else:
         fn, random = ref_bf16, FIXED_RBITS & 0xFFFF
     return fn(a, random), fn(FIXED_B, random)
-
 
 def check_d(test: dict[str, object], a: int, d: int, context: str) -> tuple[int, int]:
     exact = nan = 0
@@ -301,7 +363,6 @@ def check_d(test: dict[str, object], a: int, d: int, context: str) -> tuple[int,
             exact += 1
     return exact, nan
 
-
 def selftest() -> None:
     assert TOTAL_RECORDS == 25_165_825
     assert (FIXED_RBITS & 0xE000E000) == 0
@@ -310,10 +371,9 @@ def selftest() -> None:
     assert ref_bf16(0x3F800000, 0x1FFF) == ("exact", 0x3F80)
     assert ref_bf16(0x7F800000, 0) == ("exact", 0x7F7F)
 
-
 def build(nvcc: str) -> tuple[Path, dict[str, object]]:
     version_text = command([nvcc, "--version"])
-    match = re.search(r"release\s+(\d+)\.(\d+)", version_text)
+    match = re.search(r"release\s+(\d+)**\.**(\d+)", version_text)
     if not match or (int(match.group(1)), int(match.group(2))) < (12, 8):
         raise RuntimeError("CUDA 12.8+ required")
     GENERATED.parent.mkdir(parents=True, exist_ok=True)
@@ -339,12 +399,10 @@ def build(nvcc: str) -> tuple[Path, dict[str, object]]:
                    "sass_mapping": mapping, "sass_sha256": sha256(SASS),
                    "cuda_source_sha256": sha256(GENERATED), "executable_sha256": sha256(BUILD)}
 
-
 def validate_size(path: Path, test: dict[str, object], records: int) -> None:
     del test
     if path.stat().st_size != records * RECORD_SIZE:
         raise RuntimeError(f"size mismatch: {path}")
-
 
 def validate(path: Path, test: dict[str, object], *, first_a: int = A_BEGIN,
              records: int = TOTAL_RECORDS) -> dict[str, int | str]:
@@ -362,7 +420,6 @@ def validate(path: Path, test: dict[str, object], *, first_a: int = A_BEGIN,
             nan += nan_matched
     return {"records": records, "lanes": records * 2, "exact_bit_matches": exact,
             "nan_class_matches": nan, "bytes": path.stat().st_size, "sha256": sha256(path)}
-
 
 def precheck(binary: Path, output: Path, provenance: dict[str, object]) -> Path:
     cases = (A_BEGIN, 0x337FFFFF, 0x33800000, 0x33FFFFFF, 0x34000000,
@@ -391,10 +448,8 @@ def precheck(binary: Path, output: Path, provenance: dict[str, object]) -> Path:
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     return path
 
-
 def result_path(output: Path, test: dict[str, object]) -> Path:
     return output / "full" / str(test["slug"]) / "d.bin"
-
 
 def report(output: Path, summaries: dict[str, dict[str, int | str]] | None = None) -> Path:
     precheck_path = output / "precheck-report.json"
@@ -415,7 +470,6 @@ def report(output: Path, summaries: dict[str, dict[str, int | str]] | None = Non
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return path
 
-
 def plan(output: Path) -> None:
     per_test = TOTAL_RECORDS * RECORD_SIZE
     print(f"A: 0x{A_BEGIN:08x}..0x{A_END:08x}, stride 1, inclusive")
@@ -427,7 +481,6 @@ def plan(output: Path) -> None:
     for test in TESTS:
         path = result_path(output, test)
         print(f"{test['slug']}: {'present' if path.is_file() else 'pending'} -> {path}")
-
 
 def full_run(options: argparse.Namespace) -> None:
     output = options.output_dir.resolve()
@@ -453,13 +506,11 @@ def full_run(options: argparse.Namespace) -> None:
     print(f"FULL PASS: {TOTAL_RECORDS} A values x {len(TESTS)} instructions")
     print(f"report: {path}")
 
-
 def precheck_only(options: argparse.Namespace) -> None:
     output = options.output_dir.resolve()
     binary, provenance = build(options.nvcc)
     path = precheck(binary, output, provenance)
     print(f"PRECHECK PASS: {path}")
-
 
 def main() -> None:
     options = args()
@@ -477,7 +528,6 @@ def main() -> None:
     else:
         print(f"REPORT PASS: {report(options.output_dir.resolve())}")
 
-
 if __name__ == "__main__":
     try:
         main()
@@ -486,3 +536,112 @@ if __name__ == "__main__":
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         sys.exit(1)
+
+```
+
+这个文件是 B200 上两条随机舍入 `.rs` 指令的正式批量测试脚本，不是单值 probe。
+
+它验证：
+
+```Plain Text
+cvt.rs.satfinite.f16x2.f32  d, a, b, rbits;
+cvt.rs.satfinite.bf16x2.f32 d, a, b, rbits;
+```
+
+## 测试范围
+
+脚本当前写死：
+
+```Plain Text
+A      = 0x33000000～0x34800000
+stride = 1
+B      = 0xDEADBEEF
+rbits  = 0x1FFF1FFF
+```
+
+每条指令测试：
+
+```Plain Text
+25,165,825 个 A
+```
+
+两条指令合计约 192 MiB 输出。
+
+## 具体行为
+
+自动生成 CUDA 文件：
+
+```Plain Text
+B200/generated/b200_cvt_rs_f16_bf16_generated.cu
+```
+
+使用 `sm_100a` 编译。
+
+反汇编检查 PTX 是否映射为：
+
+```Plain Text
+F2FP.SATFINITE.F16.F32.PACK_AB.RS
+F2FP.SATFINITE.BF16.F32.PACK_AB.RS
+```
+
+检查 kernel 中是否确实包含：
+
+```Plain Text
+global Input[] → 3×LDG → PTX → STG
+```
+
+5. 对边界值重复执行，确认固定 `rbits` 时结果稳定。
+
+6. 全量遍历 A，并用独立软件参考逐条比较两个 lane。
+
+7. 生成无 header 的结果文件和 JSON 报告。
+
+## 输出文件
+
+每个 `.bin` 只保存连续的 little\-endian `uint32 d`：
+
+```Plain Text
+B200/results/cvt-rs-satfinite-bf16x2-f32/full/f16x2/d.bin
+B200/results/cvt-rs-satfinite-bf16x2-f32/full/bf16x2/d.bin
+```
+
+```Plain Text
+offset 0: d[0]
+offset 4: d[1]
+offset 8: d[2]
+...
+```
+
+第 `i` 个结果对应：
+
+```Plain Text
+A = 0x33000000 + i
+```
+
+## 使用方法
+
+```Plain Text
+# 只检查软件参考模型
+python3 run_b200_cvt_rs_bf16x2.py selftest
+
+# 查看范围和容量
+python3 run_b200_cvt_rs_bf16x2.py plan
+
+# 编译、反汇编和边界检查
+python3 run_b200_cvt_rs_bf16x2.py precheck
+
+# 跑两条指令的完整范围
+python3 run_b200_cvt_rs_bf16x2.py run
+
+# 检查已有结果并重新生成报告
+python3 run_b200_cvt_rs_bf16x2.py report
+```
+
+## 脚本测试历史
+
+| 日期 | 测试阶段 | 范围/内容 | 结果 |
+|---|---|---|---|
+| 2026-07-17 | `selftest` | 区间、`rbits` 布局及 FP16/BF16 参考模型 | `PASS` |
+| 2026-07-17 | `precheck` | B200、`sm_100a`、边界值及 PTX → SASS 映射 | `PASS` |
+| 2026-07-17 | `run` | `A = 0x33000000～0x34800000`，stride 1；两条指令各 25,165,825 条记录 | `FULL PASS`；独立参考逐 bit 一致；FP16x2 SHA256：`225d4735…64fba44`；BF16x2 SHA256：`93c6e6c4…9506126` |
+

@@ -19,7 +19,7 @@
 4. 对合法输入运行 baseline 与 repeat，逐字节确认确定性；
 5. 用不依赖 GPU 输出的整数/指数 BF16 模型逐 lane 比较；
 6. 按 README Comments 范围运行 16 个可续跑分片；
-7. 校验 header、输入枚举、文件集合、manifest 和 SHA256；
+7. 校验 headerless payload、输入枚举、文件集合、manifest 和 SHA256；
 8. 生成 JSON 与 Markdown 正式报告。
 
 推荐在 GB10 本机一次离线跑完：
@@ -91,7 +91,7 @@ E2M3/E3M2 的 packed `.b16` source 每个 byte 只有低 6 bit 是数值，高 2
 4. 对每条具体 PTX 执行单记录 preflight；
 5. 两次执行 smoke 并逐字节验证确定性；
 6. 按 16 个分片运行或续跑全部 sweep；
-7. 逐记录校验输入枚举、`test_id`、header、文件长度和 `.partial`；
+7. 逐记录校验输入枚举、manifest `test_id`、payload 文件长度和 `.partial`；
 8. 在运行时原始 manifest 中保存 matrix/spec/file SHA256；
 9. 严格验证原始 manifest，生成最终 `full-run-report.json`，不从当前代码重建历史 provenance。
 
@@ -140,7 +140,7 @@ python3 run_gb10_all_strided.py report
 python3 run_gb10_all_strided.py seal
 ```
 
-该命令不会重新执行 GPU sweep。它要求旧 manifest 中的 PTX、sweep、range 和文件集合与当前矩阵完全一致，再逐条检查 2,000 个 `.bin` 的输入枚举和 header，计算 SHA256，并原子升级 manifest。若 provenance 不一致会停止，不会把旧数据重新标成新定义。
+该命令不会重新执行 GPU sweep。它要求旧 manifest 中的 PTX、sweep、range 和文件集合与当前矩阵完全一致，再逐条检查 2,000 个 `.bin` 的输入枚举和 headerless payload 大小，计算 SHA256，并原子升级 manifest。若 provenance 不一致会停止，不会把旧数据重新标成新定义。
 
 `seal` 需要顺序读取约 12.846 GiB。环境中有 NumPy 时会自动分块向量化；没有 NumPy 也能运行，但全记录校验会明显变慢。可先确认：
 
@@ -243,7 +243,7 @@ python3 run_gb10_ptx_accuracy.py \
   --plan
 ```
 
-`run_gb10_ptx_accuracy.py` 负责测试矩阵、CUDA 生成、编译、执行、二进制 header、manifest 和 reference-dir 比较。正常正式测试优先使用 `run_gb10_all_strided.py`，避免手工遗漏分片。
+`run_gb10_ptx_accuracy.py` 负责测试矩阵、CUDA 生成、编译、执行、headerless 二进制 payload、manifest 和 reference-dir 比较。正常正式测试优先使用 `run_gb10_all_strided.py`，避免手工遗漏分片。
 
 ## 结果语义
 
@@ -265,7 +265,7 @@ accuracy_status = NOT_INDEPENDENTLY_VALIDATED 或 PARTIAL_REFERENCE_PASS
 
 ## 二进制格式
 
-每个文件包含 256-byte little-endian header 和连续 16-byte records：
+每个 `.bin` 都没有 header，从 byte 0 开始连续保存 16-byte records：
 
 ```text
 uint32 source_a
@@ -277,10 +277,10 @@ uint32 masked_result
 文件大小：
 
 ```text
-256 + shard_records × 16 bytes
+shard_records × 16 bytes
 ```
 
-header 保存格式版本、具体指令名、`test_id`、result mask、完整 sweep 记录数、分片起点和分片记录数。输入范围、stride、matrix/spec SHA256 和完整文件 SHA256 记录在运行时原始 manifest 中。结果与 manifest 都先写入 `.partial`，校验成功后再原子替换。
+格式版本、具体指令名、`test_id`、result mask、完整 sweep 记录数、分片起点、输入范围、stride、matrix/spec SHA256 和完整文件 SHA256 全部记录在运行时 manifest JSON 中。结果与 manifest 都先写入 `.partial`，校验成功后再原子替换。
 
 ## CPU 合约测试
 

@@ -314,20 +314,12 @@ def validate_manifest_entry(
                 f"manifest provenance mismatch for {relative}: "
                 f"{field}={entry.get(field)!r}, expected={expected!r}"
             )
-    header = runner.read_header(path)
-    for field in (
-        "test_id",
-        "test_name",
-        "result_mask",
-        "total_records",
-        "shard_start",
-        "shard_records",
-    ):
-        if header[field] != expected_metadata[field]:
-            raise RuntimeError(
-                f"binary header mismatch for {relative}: "
-                f"{field}={header[field]!r}, expected={expected_metadata[field]!r}"
-            )
+    layout = runner.read_payload_layout(path)
+    if layout["bytes"] != expected_metadata["bytes"]:
+        raise RuntimeError(
+            f"binary payload size mismatch for {relative}: "
+            f"{layout['bytes']} != {expected_metadata['bytes']}"
+        )
     digest = runner.validate_binary_inputs(path, sweep, start, count)
     spec_digest = runner.sweep_spec_sha256(test, sweep)
     if require_digests:
@@ -363,7 +355,7 @@ def validate_shard_manifest(
     matrix_digest = runner.matrix_sha256(tests)
     path, payload = read_shard_manifest(output_dir, tests, shard_index)
     expected_top = {
-        "manifest_version": 2,
+        "manifest_version": 3,
         "profile": "full",
         "shard_index": shard_index,
         "shard_count": SHARD_COUNT,
@@ -373,7 +365,7 @@ def validate_shard_manifest(
     for field, expected in expected_top.items():
         if payload.get(field) != expected:
             raise RuntimeError(
-                f"manifest header mismatch in {path}: "
+                f"manifest metadata mismatch in {path}: "
                 f"{field}={payload.get(field)!r}, expected={expected!r}"
             )
     entries = payload.get("result_files")
@@ -478,7 +470,7 @@ def unsealed_manifest_shards(
         except Exception:
             unsealed.append(shard_index)
             continue
-        if payload.get("manifest_version") != 2:
+        if payload.get("manifest_version") != 3:
             unsealed.append(shard_index)
     return unsealed
 
@@ -516,7 +508,7 @@ def seal_shard_manifest(
     shard_index: int,
 ) -> Path:
     path, payload = read_shard_manifest(output_dir, tests, shard_index)
-    if payload.get("manifest_version") == 2:
+    if payload.get("manifest_version") == 3:
         return validate_shard_manifest(output_dir, tests, shard_index)
     expected_top = {
         "profile": "full",
@@ -527,7 +519,7 @@ def seal_shard_manifest(
     for field, expected in expected_top.items():
         if payload.get(field) != expected:
             raise RuntimeError(
-                f"legacy manifest header mismatch in {path}: "
+                f"legacy manifest metadata mismatch in {path}: "
                 f"{field}={payload.get(field)!r}, expected={expected!r}"
             )
     entries = payload.get("result_files")
@@ -554,7 +546,7 @@ def seal_shard_manifest(
     sealed = dict(payload)
     sealed.update(
         {
-            "manifest_version": 2,
+            "manifest_version": 3,
             "matrix_sha256": runner.matrix_sha256(tests),
             "result_files": sealed_entries,
         }

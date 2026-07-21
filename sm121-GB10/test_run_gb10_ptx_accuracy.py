@@ -47,20 +47,6 @@ def write_synthetic_result(
     start, count = runner.shard_slice(sweep.count, shard_index, all_strided.SHARD_COUNT)
     path = all_strided.expected_path(output, test, sweep, shard_index)
     path.parent.mkdir(parents=True)
-    name = test.name.encode()
-    header = runner.HEADER_STRUCT.pack(
-        runner.MAGIC,
-        runner.FORMAT_VERSION,
-        runner.HEADER_SIZE,
-        runner.RECORD_SIZE,
-        test_id,
-        test.mask,
-        sweep.count,
-        start,
-        count,
-        name + b"\0" * (160 - len(name)),
-        b"\0" * 44,
-    )
     records = bytearray()
     for local in range(count):
         linear = start + local
@@ -77,10 +63,16 @@ def write_synthetic_result(
                 0x1234,
             )
         )
-    path.write_bytes(header + records)
-    summary = runner.read_header(path)
+    path.write_bytes(records)
+    summary = runner.read_payload_layout(path)
     summary.update(
         {
+            "test_id": test_id,
+            "test_name": test.name,
+            "result_mask": test.mask,
+            "total_records": sweep.count,
+            "shard_start": start,
+            "shard_records": count,
             "ptx": test.ptx,
             "sweep": sweep.name,
             "file": path.relative_to(output).as_posix(),
@@ -105,7 +97,7 @@ def write_synthetic_result(
         manifest.write_text(
             runner.json.dumps(
                 {
-                    "format": "GB10 PTX accuracy binary v1",
+                    "format": "GB10 PTX accuracy headerless records v2",
                     "profile": "full",
                     "shard_index": shard_index,
                     "shard_count": all_strided.SHARD_COUNT,
@@ -187,8 +179,8 @@ class RunnerContractTests(unittest.TestCase):
         tests = runner.select_tests(["fp16x2_to_f6x2*"])
         full = runner.projected_bytes(tests, "full", 0, 1, None)
         shard = runner.projected_bytes(tests, "full", 0, 16, None)
-        self.assertEqual(full, 35_072)
-        self.assertEqual(shard, 4_096)
+        self.assertEqual(full, 33_024)
+        self.assertEqual(shard, 2_048)
         with redirect_stdout(io.StringIO()):
             runner.print_plan(tests, Path("/tmp/results"), "full", 0, 16, None)
 
@@ -201,11 +193,11 @@ class RunnerContractTests(unittest.TestCase):
         self.assertTrue(all(test.min_cuda <= (13, 1) for test in tests))
         self.assertEqual(
             runner.projected_bytes(tests, "full", 0, 1, None),
-            4_331_264,
+            4_326_144,
         )
         self.assertAlmostEqual(
             runner.projected_bytes(tests, "full", 0, 16, None) / 1024**3,
-            0.00025653743743896484,
+            0.00025177001953125,
         )
 
     def test_all_strided_matrix_covers_every_supported_gb10_test(self) -> None:
@@ -217,7 +209,7 @@ class RunnerContractTests(unittest.TestCase):
             runner.projected_bytes(cuda_131, "full", index, 16, None)
             for index in range(16)
         )
-        self.assertEqual(total_131, 13_793_736_896)
+        self.assertEqual(total_131, 13_793_224_896)
 
     def test_integrity_manifest_rejects_payload_mutation(self) -> None:
         test = runner.select_tests(
@@ -265,7 +257,7 @@ class RunnerContractTests(unittest.TestCase):
             _binary, manifest = write_synthetic_result(output, test, sealed=False)
             all_strided.seal_shard_manifest(output, [test], 0)
             payload = runner.json.loads(manifest.read_text())
-            self.assertEqual(payload["manifest_version"], 2)
+            self.assertEqual(payload["manifest_version"], 3)
             self.assertEqual(payload["matrix_sha256"], runner.matrix_sha256([test]))
             self.assertEqual(payload["result_files"][0]["ptx"], test.ptx)
             self.assertEqual(len(payload["result_files"][0]["sha256"]), 64)

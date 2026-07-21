@@ -300,18 +300,9 @@ def validate_reference_tree(
                 / runner.safe_name(test.name)
                 / f"{runner.safe_name(sweep.name)}__shard-00000-of-00001.bin"
             )
-            header = runner.read_header(path)
-            expected_header = {
-                "test_id": test_id,
-                "test_name": test.name,
-                "result_mask": 0xFFFFFFFF,
-                "total_records": sweep.count,
-                "shard_start": 0,
-                "shard_records": sweep.count,
-            }
-            for field, expected in expected_header.items():
-                if header[field] != expected:
-                    raise RuntimeError(f"reference header mismatch: {path}: {field}")
+            layout = runner.read_payload_layout(path)
+            if layout["shard_records"] != sweep.count:
+                raise RuntimeError(f"reference payload size mismatch: {path}")
             runner.validate_binary_inputs(path, sweep, 0, sweep.count)
             with path.open("rb") as stream:
                 stream.seek(runner.HEADER_SIZE)

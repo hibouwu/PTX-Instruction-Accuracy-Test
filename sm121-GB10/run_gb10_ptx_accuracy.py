@@ -36,12 +36,9 @@ DEFAULT_GENERATED_DIR = ROOT / "generated"
 DEFAULT_BUILD_DIR = ROOT / "build"
 DEFAULT_OUTPUT_DIR = ROOT / "results"
 
-HEADER_SIZE = 256
+HEADER_SIZE = 0
 RECORD_SIZE = 16
-HEADER_STRUCT = struct.Struct("<8sIIIIIQQQ160s44s")
 RECORD_STRUCT = struct.Struct("<IIII")
-MAGIC = b"GB10PTX\0"
-FORMAT_VERSION = 1
 LARGE_OUTPUT_BYTES = 16 * 1024**3
 
 
@@ -468,20 +465,6 @@ static constexpr uint32_t kTestMasks[kTestCount] = {
 };
 
 #pragma pack(push, 1)
-struct BinHeader {
-  char magic[8];
-  uint32_t version;
-  uint32_t header_size;
-  uint32_t record_size;
-  uint32_t test_id;
-  uint32_t result_mask;
-  uint64_t total_records;
-  uint64_t shard_start;
-  uint64_t shard_records;
-  char test_name[160];
-  char reserved[44];
-};
-
 struct Record {
   uint32_t source_a;
   uint32_t source_b;
@@ -490,7 +473,6 @@ struct Record {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(BinHeader) == 256, "binary header must be 256 bytes");
 static_assert(sizeof(Record) == 16, "binary record must be 16 bytes");
 
 struct RangeSpec {
@@ -601,25 +583,11 @@ int main(int argc, char** argv) {
     return 4;
   }
 
-  BinHeader header{};
-  std::memcpy(header.magic, "GB10PTX", 7);
-  header.version = 1;
-  header.header_size = sizeof(BinHeader);
-  header.record_size = sizeof(Record);
-  header.test_id = static_cast<uint32_t>(test_id);
-  header.result_mask = kTestMasks[test_id];
-  header.total_records = total_records;
-  header.shard_start = shard_start;
-  header.shard_records = shard_count;
-  std::snprintf(header.test_name, sizeof(header.test_name), "%s", kTestNames[test_id]);
-
   std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
   if (!output) {
     std::fprintf(stderr, "cannot open output: %s\n", output_path);
     return 5;
   }
-  output.write(reinterpret_cast<char const*>(&header), sizeof(header));
-
   uint64_t allocation_count = std::min(chunk_records, std::max<uint64_t>(1, shard_count));
   Record* device_records = nullptr;
   CUDA_CHECK(cudaMalloc(&device_records, allocation_count * sizeof(Record)));
@@ -898,41 +866,17 @@ def shard_slice(total: int, index: int, count: int) -> tuple[int, int]:
     return start, end - start
 
 
-def read_header(path: Path) -> dict[str, object]:
-    with path.open("rb") as stream:
-        raw = stream.read(HEADER_SIZE)
-    if len(raw) != HEADER_SIZE:
-        raise RuntimeError(f"truncated binary header: {path}")
-    (
-        magic,
-        version,
-        header_size,
-        record_size,
-        test_id,
-        result_mask,
-        total_records,
-        shard_start,
-        shard_records,
-        raw_name,
-        _reserved,
-    ) = HEADER_STRUCT.unpack(raw)
-    if magic != MAGIC or version != FORMAT_VERSION:
-        raise RuntimeError(f"invalid binary magic/version: {path}")
-    if header_size != HEADER_SIZE or record_size != RECORD_SIZE:
-        raise RuntimeError(f"unsupported binary layout: {path}")
-    expected_size = HEADER_SIZE + shard_records * RECORD_SIZE
+def read_payload_layout(path: Path) -> dict[str, object]:
+    """Validate and describe a headerless fixed-width record payload."""
     actual_size = path.stat().st_size
-    if actual_size != expected_size:
+    if actual_size % RECORD_SIZE:
         raise RuntimeError(
-            f"binary size mismatch for {path}: expected {expected_size}, got {actual_size}"
+            f"headerless binary size is not record-aligned: {path}: {actual_size}"
         )
     return {
-        "test_id": test_id,
-        "test_name": raw_name.split(b"\0", 1)[0].decode("utf-8"),
-        "result_mask": result_mask,
-        "total_records": total_records,
-        "shard_start": shard_start,
-        "shard_records": shard_records,
+        "header_size": 0,
+        "record_size": RECORD_SIZE,
+        "shard_records": actual_size // RECORD_SIZE,
         "bytes": actual_size,
     }
 
@@ -957,7 +901,7 @@ def validate_binary_inputs(
     with path.open("rb") as stream:
         header = stream.read(HEADER_SIZE)
         if len(header) != HEADER_SIZE:
-            raise RuntimeError(f"truncated binary header: {path}")
+            raise RuntimeError(f"truncated binary payload prefix: {path}")
         digest.update(header)
         for local_index in range(shard_records):
             raw = stream.read(RECORD_SIZE)
@@ -999,7 +943,7 @@ def _validate_binary_inputs_numpy(
     with path.open("rb") as stream:
         header = stream.read(HEADER_SIZE)
     if len(header) != HEADER_SIZE:
-        raise RuntimeError(f"truncated binary header: {path}")
+        raise RuntimeError(f"truncated binary payload prefix: {path}")
     digest.update(header)
     records = np.memmap(
         path,
@@ -1055,25 +999,15 @@ def _validate_binary_inputs_numpy(
 def compare_binary(actual: Path, reference: Path) -> None:
     if not reference.exists():
         raise RuntimeError(f"reference file missing: {reference}")
-    actual_header = read_header(actual)
-    reference_header = read_header(reference)
-    semantic_fields = (
-        "test_name",
-        "result_mask",
-        "total_records",
-        "shard_start",
-        "shard_records",
-    )
-    for field in semantic_fields:
-        if actual_header[field] != reference_header[field]:
-            raise RuntimeError(
-                f"reference header mismatch for {actual.name}: {field}: "
-                f"actual={actual_header[field]!r}, reference={reference_header[field]!r}"
-            )
-    offset = HEADER_SIZE
+    actual_layout = read_payload_layout(actual)
+    reference_layout = read_payload_layout(reference)
+    if actual_layout["bytes"] != reference_layout["bytes"]:
+        raise RuntimeError(
+            f"reference payload size mismatch for {actual.name}: "
+            f"actual={actual_layout['bytes']}, reference={reference_layout['bytes']}"
+        )
+    offset = 0
     with actual.open("rb") as actual_stream, reference.open("rb") as reference_stream:
-        actual_stream.seek(HEADER_SIZE)
-        reference_stream.seek(HEADER_SIZE)
         while True:
             actual_chunk = actual_stream.read(8 * 1024 * 1024)
             reference_chunk = reference_stream.read(8 * 1024 * 1024)
@@ -1140,21 +1074,20 @@ def execute_tests(
         command.extend(range_args(sweep.c))
         command.extend([chunk_records, partial_output])
         run(command)
-        summary = read_header(partial_output)
-        expected_header = {
+        summary = read_payload_layout(partial_output)
+        if summary["shard_records"] != count:
+            raise RuntimeError(
+                f"generated payload record mismatch for {partial_output}: "
+                f"{summary['shard_records']} != {count}"
+            )
+        summary.update({
             "test_id": test_id,
             "test_name": test.name,
             "result_mask": test.mask,
             "total_records": sweep.count,
             "shard_start": start,
             "shard_records": count,
-        }
-        for field, expected in expected_header.items():
-            if summary[field] != expected:
-                raise RuntimeError(
-                    f"generated binary header mismatch for {partial_output}: "
-                    f"{field}={summary[field]!r}, expected={expected!r}"
-                )
+        })
         binary_sha256 = validate_binary_inputs(partial_output, sweep, start, count)
         summary.update(
             {
@@ -1194,14 +1127,14 @@ def preflight_tests(binary: Path, tests: Sequence[Test]) -> None:
             command.extend([1, output])
             try:
                 run(command)
-                header = read_header(output)
+                layout = read_payload_layout(output)
             except Exception as error:
                 raise RuntimeError(
                     f"preflight failed for {test.name} ({test.ptx}); "
                     "do not start the full sweep until architecture, CUDA toolkit, "
                     f"and driver compatibility are resolved: {error}"
                 ) from error
-            if header["test_name"] != test.name or header["shard_records"] != 1:
+            if layout["shard_records"] != 1:
                 raise RuntimeError(f"invalid preflight output for {test.name}")
             log(f"PREFLIGHT PASS {test.name}")
 
@@ -1216,8 +1149,8 @@ def write_manifest(
 ) -> Path:
     manifest = manifest_path(output_dir, tests, shard_index, shard_count)
     payload = {
-        "manifest_version": 2,
-        "format": "GB10 PTX accuracy binary v1",
+        "manifest_version": 3,
+        "format": "GB10 PTX accuracy headerless records v2",
         "profile": profile,
         "shard_index": shard_index,
         "shard_count": shard_count,

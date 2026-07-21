@@ -2,7 +2,11 @@
 """B200 stride-1 test for FP16x2/BF16x2 stochastic conversion.
 
 The generated CUDA runner uses global Input[] -> 3x LDG -> inline PTX ->
-global d[] -> binary dump. Each binary payload contains only uint32 d values.
+global d[] -> binary dump. A spans 0x23000000..0x33000000 inclusively;
+B and rbits are fixed. Each binary payload contains only uint32 d values.
+
+Formal domain: A=0x23000000..0x33000000 inclusive, B=0xdeadbeef,
+Rbits=0x1fff1fff. Both f16x2 and bf16x2 forms are captured and checked.
 """
 
 from __future__ import annotations
@@ -21,14 +25,14 @@ from typing import Sequence
 
 
 ROOT = Path(__file__).resolve().parent
-GENERATED = ROOT / "generated" / "b200_cvt_rs_f16_bf16_generated.cu"
-BUILD = ROOT / "build" / "b200_cvt_rs_f16_bf16"
-SASS = ROOT / "build" / "b200_cvt_rs_f16_bf16.sass"
-DEFAULT_OUTPUT = ROOT / "results" / "cvt-rs-satfinite-bf16x2-f32"
+GENERATED = ROOT / "generated" / "b200_cvt_rs_f16_bf16_a23000000_a33000000_generated.cu"
+BUILD = ROOT / "build" / "b200_cvt_rs_f16_bf16_a23000000_a33000000"
+SASS = ROOT / "build" / "b200_cvt_rs_f16_bf16_a23000000_a33000000.sass"
+DEFAULT_OUTPUT = ROOT / "results" / "cvt-rs-satfinite-f16-bf16-a23000000-a33000000"
 DEFAULT_NVCC = "/usr/local/cuda/bin/nvcc"
 ARCH = "sm_100a"
-A_BEGIN = 0x33000000
-A_END = 0x34800000
+A_BEGIN = 0x23000000
+A_END = 0x33000000
 FIXED_B = 0xDEADBEEF
 FIXED_RBITS = 0x1FFF1FFF
 TOTAL_RECORDS = A_END - A_BEGIN + 1
@@ -73,8 +77,8 @@ CUDA_SOURCE = r'''#include <cuda_runtime.h>
   }                                                                          \
 } while (0)
 
-static constexpr std::uint32_t kABegin = 0x33000000u;
-static constexpr std::uint32_t kAEnd = 0x34800000u;
+static constexpr std::uint32_t kABegin = 0x23000000u;
+static constexpr std::uint32_t kAEnd = 0x33000000u;
 static constexpr std::uint32_t kFixedB = 0xdeadbeefu;
 static constexpr std::uint32_t kFixedRbits = 0x1fff1fffu;
 static constexpr std::uint64_t kTotal =
@@ -208,7 +212,8 @@ int main(int argc, char** argv) {
 
 
 def args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="B200 FP16x2/BF16x2 .rs stride-1 test")
+    parser = argparse.ArgumentParser(
+        description="B200 FP16x2/BF16x2 .rs test for A=0x23000000..0x33000000")
     parser.add_argument("command", choices=("selftest", "plan", "precheck", "run", "report"))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--nvcc", default=DEFAULT_NVCC)
@@ -282,10 +287,12 @@ def ref_f16(source: int, random13: int) -> tuple[str, int | None]:
 
 def expected(test: dict[str, object], a: int) -> tuple[tuple[str, int | None], tuple[str, int | None]]:
     if test["slug"] == "f16x2":
-        fn, random = ref_f16, FIXED_RBITS & 0x1FFF
+        fn, mask = ref_f16, 0x1FFF
     else:
-        fn, random = ref_bf16, FIXED_RBITS & 0xFFFF
-    return fn(a, random), fn(FIXED_B, random)
+        fn, mask = ref_bf16, 0xFFFF
+    random_a = (FIXED_RBITS >> 16) & mask
+    random_b = FIXED_RBITS & mask
+    return fn(a, random_a), fn(FIXED_B, random_b)
 
 
 def check_d(test: dict[str, object], a: int, d: int, context: str) -> tuple[int, int]:
@@ -303,7 +310,7 @@ def check_d(test: dict[str, object], a: int, d: int, context: str) -> tuple[int,
 
 
 def selftest() -> None:
-    assert TOTAL_RECORDS == 25_165_825
+    assert TOTAL_RECORDS == 268_435_457
     assert (FIXED_RBITS & 0xE000E000) == 0
     assert ref_f16(0x33800000, 0) == ("exact", 1)
     assert ref_f16(0x3F800000, 0x1FFF) == ("exact", 0x3C00)
@@ -346,27 +353,73 @@ def validate_size(path: Path, test: dict[str, object], records: int) -> None:
         raise RuntimeError(f"size mismatch: {path}")
 
 
+def _validate_full_numpy(path: Path, test: dict[str, object], first_a: int,
+                         records: int) -> tuple[int, int]:
+    """Vectorized independent reference for this positive finite formal range."""
+    try:
+        import numpy as np
+    except ImportError as error:
+        raise RuntimeError("NumPy is required to validate the two full 1 GiB outputs") from error
+
+    actual = np.memmap(path, dtype="<u4", mode="r", shape=(records,))
+    fixed_kind, fixed_value = expected(test, first_a)[1]
+    if fixed_kind != "exact":
+        raise RuntimeError("fixed B unexpectedly has a non-exact reference class")
+    fixed = int(fixed_value)
+    chunk = 8 * 1024 * 1024
+    for begin in range(0, records, chunk):
+        end = min(records, begin + chunk)
+        source = np.arange(first_a + begin, first_a + end, dtype=np.uint64)
+        if test["slug"] == "bf16x2":
+            high = ((source >> 16) + (((source & 0xffff) +
+                    ((FIXED_RBITS >> 16) & 0xffff)) >> 16)) & 0xffff
+        else:
+            exponent = ((source >> 23) & 0xff).astype(np.int64) - 127
+            significand = np.uint64(0x800000) | (source & 0x7fffff)
+            shift = (-exponent - 1).astype(np.uint64)
+            base = significand >> shift
+            remainder = significand - (base << shift)
+            discarded = remainder >> (shift - 13)
+            high = (base + ((discarded +
+                    ((FIXED_RBITS >> 16) & 0x1fff)) >> 13)) & 0xffff
+        wanted = ((high.astype(np.uint32) << 16) | np.uint32(fixed))
+        mismatch = np.flatnonzero(actual[begin:end] != wanted)
+        if mismatch.size:
+            local = int(mismatch[0])
+            index = begin + local
+            raise RuntimeError(
+                f"reference mismatch {path} index={index} "
+                f"A=0x{first_a + index:08x}: actual=0x{int(actual[index]):08x} "
+                f"expected=0x{int(wanted[local]):08x}"
+            )
+    return records * 2, 0
+
+
 def validate(path: Path, test: dict[str, object], *, first_a: int = A_BEGIN,
              records: int = TOTAL_RECORDS) -> dict[str, int | str]:
     validate_size(path, test, records)
-    exact = nan = 0
-    with path.open("rb") as stream:
-        stream.seek(HEADER_SIZE)
-        for index in range(records):
-            raw = stream.read(RECORD_SIZE)
-            if len(raw) != RECORD_SIZE:
-                raise RuntimeError(f"truncated result {index}: {path}")
-            d, = RESULT.unpack(raw)
-            matched, nan_matched = check_d(test, first_a + index, d, f"{path} index={index}")
-            exact += matched
-            nan += nan_matched
+    if records > 1_000_000:
+        exact, nan = _validate_full_numpy(path, test, first_a, records)
+    else:
+        exact = nan = 0
+        with path.open("rb") as stream:
+            for index in range(records):
+                raw = stream.read(RECORD_SIZE)
+                if len(raw) != RECORD_SIZE:
+                    raise RuntimeError(f"truncated result {index}: {path}")
+                d, = RESULT.unpack(raw)
+                matched, nan_matched = check_d(
+                    test, first_a + index, d, f"{path} index={index}"
+                )
+                exact += matched
+                nan += nan_matched
     return {"records": records, "lanes": records * 2, "exact_bit_matches": exact,
             "nan_class_matches": nan, "bytes": path.stat().st_size, "sha256": sha256(path)}
 
 
 def precheck(binary: Path, output: Path, provenance: dict[str, object]) -> Path:
-    cases = (A_BEGIN, 0x337FFFFF, 0x33800000, 0x33FFFFFF, 0x34000000,
-             A_END, 0x3F808001, 0x7FC00001)
+    cases = (A_BEGIN, A_BEGIN + 1, 0x237FFFFF, 0x23800000,
+             0x327FFFFF, 0x32800000, A_END - 1, A_END)
     observations: dict[str, list[dict[str, str]]] = {}
     with tempfile.TemporaryDirectory(prefix="b200-rs-pair-") as directory:
         temp = Path(directory)
@@ -435,7 +488,7 @@ def full_run(options: argparse.Namespace) -> None:
     required = (HEADER_SIZE + TOTAL_RECORDS * RECORD_SIZE) * 2
     output.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(output).free < required + 1024**3:
-        raise RuntimeError("output plus 1 GiB free space required")
+        raise RuntimeError("two outputs plus 1 GiB free space required")
     binary, provenance = build(options.nvcc)
     precheck(binary, output, provenance)
     summaries: dict[str, dict[str, int | str]] = {}
